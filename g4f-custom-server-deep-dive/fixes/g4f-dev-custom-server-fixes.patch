@@ -1,0 +1,235 @@
+diff --git a/dist/js/addons/addon-init.js b/dist/js/addons/addon-init.js
+index d616b99..64717d4 100644
+--- a/dist/js/addons/addon-init.js
++++ b/dist/js/addons/addon-init.js
+@@ -593,7 +593,14 @@ async function loadCustomProvidersFromAPI(customOptgroup, providersContainer = n
+             if (resp.status === 401) {
+                 appStorage.removeItem("g4f_session");
+             }
+-            privateData = await resp.json();
++            // FIX: only parse on success — a 4xx/5xx here previously threw
++            // inside the try and silently killed loading of ALL custom
++            // providers (including the public ones).
++            if (resp.ok) {
++                privateData = await resp.json();
++            } else {
++                console.warn("Failed to load private custom servers:", resp.status);
++            }
+         }
+         const publicUrl = "https://g4f.space/custom/api/servers/public";
+         const publicResp = await fetch(publicUrl);
+diff --git a/workers/api-worker.js b/workers/api-worker.js
+index ddeff8e..0c1e476 100644
+--- a/workers/api-worker.js
++++ b/workers/api-worker.js
+@@ -616,9 +616,16 @@ async function safe(request, env, ctx) {
+           return jsonResponse({ error: "Server not found" }, 404);
+         }
+         const publicServers = await getPublicServers(env);
+-        const entry = publicServers.find(s=>s.id==server.id);
++        let entry = publicServers.find(s=>s.id==server.id);
++        // FIX: allow the owner to validate/status-check their own PRIVATE
++        // servers (previously only servers present in the public index
++        // worked; private ones returned 404 even for the owner).
+         if (!entry) {
++          if (server.owner_id && user && server.owner_id == user.id) {
++            entry = { ...server, is_public: false };
++          } else {
+             return jsonResponse({ error: "Server not found" }, 404);
++          }
+         }
+         if (pathname.endsWith("/status")) {
+             delete entry.api_keys;
+@@ -636,7 +643,12 @@ async function safe(request, env, ctx) {
+         delete entry.api_keys;
+         delete entry.is_loading;
+         if (result.is_loading) entry.is_loading = true;
+-        await env.MEMBERS_KV.put("public_servers_index", JSON.stringify(publicServers));
++        // FIX: only persist the public index when the entry actually exists
++        // in it (owner-synthesized private entries must not leak into the
++        // public index).
++        if (publicServers.some(s => s.id === entry.id)) {
++          await env.MEMBERS_KV.put("public_servers_index", JSON.stringify(publicServers));
++        }
+         return jsonResponse(entry);
+       }
+       if (pathname.startsWith("/custom/") && pathname.split("/").length >= 3) {
+@@ -833,7 +845,29 @@ async function handleCreateServer(request, env) {
+   if (request.method !== "POST") {
+     return jsonResponse({ error: "Method not allowed" }, 405);
+   }
+-  const body = await request.json();
++  // FIX: per-user creation throttle. Every create attempt triggers upstream
++  // validation fetches (validateServer), so an unthrottled endpoint was an
++  // easy DoS vector against arbitrary third-party APIs. Max 5 creates /
++  // minute per user (best-effort; fails open if the KV binding is absent).
++  if (env.RATE_LIMIT) {
++    try {
++      const ok = await env.RATE_LIMIT.limit({ key: `create:${user.id}`, limit: 5, period: 60 });
++      if (!ok) {
++        return jsonResponse({
++          error: "Too many server creations — try again in a minute."
++        }, 429, { "Retry-After": "60" });
++      }
++    } catch (e) {
++      console.error("create-throttle error:", e.message);
++    }
++  }
++  // FIX: malformed JSON used to throw inside request.json() -> 500.
++  let body;
++  try {
++    body = await request.json();
++  } catch (e) {
++    return jsonResponse({ error: "Invalid JSON body" }, 400);
++  }
+   if (!body.base_url) {
+     return jsonResponse({ error: "base_url is required" }, 400);
+   }
+@@ -912,7 +946,13 @@ async function handleUpdateServer(request, env) {
+   if (request.method !== "POST" && request.method !== "PUT") {
+     return jsonResponse({ error: "Method not allowed" }, 405);
+   }
+-  const body = await request.json();
++  // FIX: malformed JSON used to throw inside request.json() -> 500.
++  let body;
++  try {
++    body = await request.json();
++  } catch (e) {
++    return jsonResponse({ error: "Invalid JSON body" }, 400);
++  }
+   if (!body.server_id) {
+     return jsonResponse({ error: "server_id is required" }, 400);
+   }
+@@ -951,7 +991,10 @@ async function handleUpdateServer(request, env) {
+       console.error("Failed to refresh models on update:", e);
+     }
+   }
+-  server.is_ollama = await isOllama(body.base_url);
++  // FIX: use the (possibly unchanged) server.base_url — body.base_url is
++  // undefined when the update payload does not include it, which made
++  // isOllama() throw and turned a plain label/is_public update into a 500.
++  server.is_ollama = await isOllama(server.base_url);
+   server.updated_at = now;
+   user.updated_at = now;
+   await saveUser(env, user);
+@@ -976,11 +1019,22 @@ async function handleDeleteServer(request, env) {
+   if (request.method !== "POST" && request.method !== "DELETE") {
+     return jsonResponse({ error: "Method not allowed" }, 405);
+   }
+-  const body = await request.json();
+-  if (!body.server_id) {
++  // FIX: tolerate DELETE requests without a JSON body (most clients send
++  // none) and also accept ?server_id=... as a fallback. The previous
++  // unconditional request.json() turned bodyless DELETEs into 500s.
++  let body = {};
++  try {
++    const text = await request.text();
++    if (text) body = JSON.parse(text);
++  } catch (e) {
++    console.error("Failed to parse delete body:", e.message);
++  }
++  const url = new URL(request.url);
++  const serverId = body.server_id || url.searchParams.get("server_id");
++  if (!serverId) {
+     return jsonResponse({ error: "server_id is required" }, 400);
+   }
+-  const serverIndex = (user.custom_servers || []).findIndex((s) => s.id === body.server_id);
++  const serverIndex = (user.custom_servers || []).findIndex((s) => s.id === serverId);
+   if (serverIndex === -1) {
+     return jsonResponse({ error: "Server not found" }, 404);
+   }
+@@ -1083,12 +1137,15 @@ async function handleUpdatePublicServers(request, env, user, ctx, cacheKey) {
+     const updated_at = new Date(s.updated_at);
+     updated_at.setHours(updated_at.getHours() + 1)
+     if (new Date() > updated_at) {
+-      s.updated_at = new Date().toISOString();
++      // FIX: do not bump updated_at before validation succeeds — previously
++      // a failed/offline server had its updated_at touched on every pass,
++      // so the hourly freshness budget (max 10 re-validations) was spent on
++      // dead servers and their error state was hidden from users.
+       try {
+         if (!("is_ollama" in s)) {
+           s.is_ollama = await isOllama(s.base_url);
+         }
+-      } catch(e) {console.error(e)}
++      } catch(e){console.error(e)}
+       if (s.is_hidden || s.is_ollama) continue;
+       try {
+         const fullServer = await getServerById(env, s.id, user);
+@@ -1107,11 +1164,15 @@ async function handleUpdatePublicServers(request, env, user, ctx, cacheKey) {
+             s.base_url = validationResult.base_url;
+           }
+           s.is_valid = true;
++          s.updated_at = new Date().toISOString();
+         } else {
+           s.is_valid = false;
++          // Mark the check as done without faking a successful update.
++          s.last_checked_at = new Date().toISOString();
+         }
+       } catch(e) {
+         s.test_result = {error: e.message};
++        s.last_checked_at = new Date().toISOString();
+       }
+       ct++;
+     }
+@@ -1156,6 +1217,13 @@ async function handleGetServerModels(request, env, serverId, user) {
+       // Auto-update stored allowed_models when enabled (default)
+       if (server.auto_update_models !== false && data.data && Array.isArray(data.data)) {
+         const freshModels = data.data.map((m) => m.id).filter(Boolean);
++        // FIX: skip the read-modify-write against the owner's user document
++        // when nothing changed (GET handlers must not churn R2 on every
++        // model list fetch, which also caused lost-update races under
++        // concurrent reads).
++        if (JSON.stringify(freshModels) === JSON.stringify(server.allowed_models || [])) {
++          freshModels.length = 0;
++        }
+         if (freshModels.length > 0 && server.owner_id) {
+           const owner = await getUser(env, server.owner_id);
+           if (owner) {
+@@ -2308,7 +2376,13 @@ async function updatePublicServerIndex(env, server, ownerId, action) {
+   } else {
+     servers = servers.filter((s) => s.id !== server.id);
+     if (action === "add" || action === "update") {
+-      servers.push(server);
++      // FIX (security): the public index is readable by every worker bound
++      // to MEMBERS_KV (and its responses are cached). Push a redacted copy
++      // so owners' API keys never rest in the shared index — the proxy
++      // already re-reads the full server (with keys) from the owner's user
++      // document in getServerById().
++      const { api_keys, ...indexEntry } = server;
++      servers.push(indexEntry);
+     }
+   }
+   await env.MEMBERS_KV.put("public_servers_index", JSON.stringify(servers));
+@@ -2413,7 +2487,12 @@ async function validateServer(env, baseUrl, apiKeysStr, defaultModel=null) {
+     headers["g4f-api-key"] = env.PASS_API_KEY;
+   }
+   let testUrl = defaultModel ? baseUrl : null
+-  baseUrl = baseUrl.replace("/chat/completions", "")
++  // FIX: only strip a TRAILING /chat/completions (the previous replace()
++  // removed the first occurrence anywhere, mangling URLs that merely
++  // contained the substring).
++  if (baseUrl.endsWith("/chat/completions")) {
++    baseUrl = baseUrl.slice(0, -"/chat/completions".length);
++  }
+   if (URL_MAP[`${baseUrl}/quota`]) {
+     testUrl = URL_MAP[`${baseUrl}/quota`];
+   }
+@@ -2461,7 +2540,7 @@ async function validateServer(env, baseUrl, apiKeysStr, defaultModel=null) {
+       if (e.name === "AbortError") {
+         return {
+           valid: false,
+-          error: "Server timeout - server did not respond within 10 seconds",
++          error: "Server timeout - server did not respond within 30 seconds",
+           details: { timeout: true },
+           base_url: baseUrl,
+           test_url: testUrl,
+@@ -2528,7 +2607,7 @@ async function validateServer(env, baseUrl, apiKeysStr, defaultModel=null) {
+       if (e.name === "AbortError") {
+         return {
+           valid: false,
+-          error: "Server timeout - server did not respond within 10 seconds",
++          error: "Server timeout - server did not respond within 30 seconds",
+           details: { timeout: true },
+           base_url: baseUrl,
+           test_url: testUrl

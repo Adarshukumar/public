@@ -1,0 +1,4151 @@
+/**
+ * G4F Members Worker
+ * 
+ * Cloudflare Worker for managing OAuth authentication, users, and API keys
+ * Uses R2 for persistent storage and KV for caching
+ * 
+ * Environment Variables Required:
+ * - GITHUB_CLIENT_ID: GitHub OAuth App Client ID
+ * - GITHUB_CLIENT_SECRET: GitHub OAuth App Client Secret
+ * - DISCORD_CLIENT_ID: Discord OAuth App Client ID
+ * - DISCORD_CLIENT_SECRET: Discord OAuth App Client Secret
+ * - HUGGINGFACE_CLIENT_ID: HuggingFace OAuth Client ID
+ * - HUGGINGFACE_CLIENT_SECRET: HuggingFace OAuth Client Secret
+ * - AIRFORCE_CLIENT_ID: Airforce OAuth Client ID
+ * - AIRFORCE_CLIENT_SECRET: Airforce OAuth Client Secret
+ * - POLLINATIONS_CLIENT_ID: Pollinations App Key (pk_...) for OAuth authorization-code flow
+ * - JWT_SECRET: Secret for signing JWT tokens
+ * - SELF_OAUTH_CLIENTS: JSON string mapping client_id -> { secret, redirect_uris[], name } for self-hosted OAuth server
+ * - MEMBERS_BUCKET: R2 bucket binding for user data
+ * - MEMBERS_KV: KV namespace binding for caching
+ * - API_KEY_SALT: Salt for generating API keys
+ */
+
+const CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Credentials": "true",
+    "Access-Control-Allow-Methods": "GET, HEAD, PUT, PATCH, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-User-Id, X-API-Key",
+    "Access-Control-Expose-Headers": "Content-Type, X-User-Id, Retry-After, X-User-Tier"
+  };
+  
+  const OAUTH_REDIRECT_URI = "https://g4f.dev/members.html";
+  
+  // Extended rate limiting configuration with time windows
+  const RATE_LIMITS = {
+    // Window durations in milliseconds
+    windows: {
+      minute: 60 * 1000,
+      hour: 60 * 60 * 1000,
+      day: 24 * 60 * 60 * 1000
+    },
+    // Burst allowance multiplier for short-term limits
+    burstMultiplier: 2
+  };
+  
+const ADMIN_USERS = {
+    discord: ["hlohaus789"],
+    github: ["hlohaus"],
+    huggingface: [],
+    airforce: []
+};
+const EXTRA_CONTRIBUTERS = ["Screenmax1234", "kirill670", "georgedorn", "yakovexplorer", "tak-gamingYT", "sasaiber", "redac1ed", "AskingAcake", "tringtoblinbus", "Yatin-Code", "meow18838"];
+
+const ALLOWED_REDIRECT_HOSTNAMES = ["localhost", "127.0.0.1", "llmplayground.net", "g4f.dev", "gpt4free.github.io"];
+
+// Hash-to-tier upgrade mappings for anonymous users
+// Maps hash values to tier upgrades
+const TIER_UPGRADE_HASHES = {
+    // Example: hash -> tier mapping
+    // "hash_value_1": "free",
+    // "hash_value_2": "pro"
+    "77178292713874715d758cab859024f2da6090ed11534eb369e7a5803335dff8": "anonymous",
+};
+
+// HTML templates for the revoke-by-key endpoint
+const REVOKE_BY_KEY_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Revoke API Key — G4F</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
+      color: #c9d1d9;
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .container {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 40px;
+      max-width: 480px;
+      width: 90%;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }
+    h1 {
+      font-size: 1.5rem;
+      margin-bottom: 8px;
+      color: #f0f6fc;
+    }
+    p.subtitle {
+      font-size: 0.9rem;
+      color: #8b949e;
+      margin-bottom: 24px;
+    }
+    label {
+      display: block;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #c9d1d9;
+      margin-bottom: 6px;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 12px 16px;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      color: #c9d1d9;
+      font-size: 0.95rem;
+      font-family: monospace;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input[type="text"]:focus {
+      border-color: #58a6ff;
+      box-shadow: 0 0 0 3px rgba(88,166,255,0.15);
+    }
+    button {
+      width: 100%;
+      margin-top: 20px;
+      padding: 12px;
+      background: #da3633;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover { background: #f85149; }
+    .note {
+      margin-top: 16px;
+      font-size: 0.8rem;
+      color: #8b949e;
+      text-align: center;
+    }
+    .note a { color: #58a6ff; text-decoration: none; }
+    .note a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🔑 Revoke API Key</h1>
+    <p class="subtitle">Enter the full API key string to permanently revoke it. This action cannot be undone.</p>
+    <form method="POST" action="/members/api/keys/revoke-by-key">
+      <label for="api_key">API Key</label>
+      <input type="text" id="api_key" name="api_key" placeholder="g4f_xxxxxxxx_…" required autofocus>
+      <button type="submit">Revoke API Key</button>
+    </form>
+    <p class="note">
+      You can also <a href="/members/api/keys">list your keys</a> and revoke by key ID.
+    </p>
+  </div>
+</body>
+</html>`;
+
+function REVOKE_BY_KEY_RESULT_HTML(status, message) {
+  const isSuccess = status === "success";
+  const icon = isSuccess ? "✅" : "❌";
+  const title = isSuccess ? "Key Revoked" : "Revocation Failed";
+  const bgColor = isSuccess ? "#1a7f37" : "#da3633";
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${title} — G4F</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
+      color: #c9d1d9;
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .container {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 40px;
+      max-width: 480px;
+      width: 90%;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      text-align: center;
+    }
+    .icon { font-size: 3rem; margin-bottom: 16px; }
+    h1 { font-size: 1.4rem; color: #f0f6fc; margin-bottom: 12px; }
+    .message {
+      font-size: 0.95rem;
+      color: #8b949e;
+      margin-bottom: 24px;
+      line-height: 1.5;
+    }
+    .status-badge {
+      display: inline-block;
+      background: ${bgColor};
+      color: #fff;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+    a.button {
+      display: inline-block;
+      padding: 10px 24px;
+      background: #21262d;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      text-decoration: none;
+      font-size: 0.9rem;
+      transition: background 0.2s;
+    }
+    a.button:hover { background: #30363d; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">${icon}</div>
+    <div class="status-badge">${isSuccess ? "SUCCESS" : "ERROR"}</div>
+    <h1>${title}</h1>
+    <p class="message">${message}</p>
+    <a class="button" href="/members/api/keys/revoke-by-key">← Try another key</a>
+  </div>
+</body>
+</html>`;
+}
+
+function getCorsHeaders(request) {
+    if (!isValidRedirect(request.headers.get("Origin"))) {
+        return CORS_HEADERS;
+    }
+    return {
+        ...CORS_HEADERS,
+        "Access-Control-Allow-Origin": request.headers.get("Origin")
+    }
+}
+
+function isValidRedirect(url) {
+    try {
+        const parsed = new URL(url);
+        return ALLOWED_REDIRECT_HOSTNAMES.includes(parsed.hostname) || parsed.hostname.endsWith(".g4f.space");
+    } catch (e) {
+        return false;
+    }
+}
+
+function getSafeUser(user) {
+    const safeUser = { ...user };
+    delete safeUser.api_keys;
+    delete safeUser.custom_servers;
+    return safeUser;
+}
+
+/**
+ * Upgrade anonymous user tier based on hash value
+ * @param {string} hashValue - The hash value to validate
+ * @returns {string|null} The upgraded tier or null if hash is invalid
+ */
+/**
+ * Calculate hash from username using simple algorithm
+ * @param {string} username - The username to hash
+ * @returns {string} The calculated hash
+ */
+async function calculateHashFromUsername(username) {
+    if (!username || typeof username !== 'string') {
+        return null;
+    }
+    // Use SubtleCrypto to generate SHA-256 hash from username
+    const encoder = new TextEncoder();
+    const data = encoder.encode(username);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    return hashHex;
+}
+
+function getUpgradedTierFromHash(hashValue) {
+    if (!hashValue || typeof hashValue !== 'string') {
+        return null;
+    }
+    // Check if hash exists in upgrade mappings
+    const upgradedTier = TIER_UPGRADE_HASHES[hashValue];
+    return upgradedTier || null;
+}
+
+/**
+ * Fetch all contributors from GitHub API (handles pagination using Link header)
+ * @param {Object} env - Environment variables containing GITHUB_TOKEN
+ * @returns {Promise<string[]>} List of contributor usernames
+ */
+async function fetchContributors(env) {
+    const contributors = [];
+    let nextUrl = "https://api.github.com/repos/xtekky/gpt4free/contributors?per_page=100";
+    
+    const headers = { "User-Agent": "G4F-Members-Worker" };
+    if (env.GITHUB_TOKEN) {
+        headers["Authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
+    }
+    
+    try {
+        while (nextUrl) {
+            const response = await fetch(nextUrl, { headers });
+            
+            if (!response.ok) {
+                console.error(`Failed to fetch contributors: ${response.status}`);
+                break;
+            }
+            
+            const data = await response.json();
+            
+            if (Array.isArray(data) && data.length > 0) {
+                contributors.push(...data.map(user => user.login));
+            }
+            
+            // Parse Link header for next page
+            nextUrl = null;
+            const linkHeader = response.headers.get("Link");
+            if (linkHeader) {
+                const links = linkHeader.split(",");
+                for (const link of links) {
+                    const match = link.match(/<([^>]+)>;\s*rel="next"/);
+                    if (match) {
+                        nextUrl = match[1];
+                        break;
+                    }
+                }
+            }
+        }
+        
+        console.log(`Fetched ${contributors.length} contributors`);
+        return contributors;
+    } catch (error) {
+        console.error("Failed to fetch contributors:", error);
+        return contributors;
+    }
+}
+
+/**
+ * Fetch sponsors from GitHub Sponsors API
+ * @returns {Promise<string[]>} List of sponsor usernames
+ */
+async function fetchSponsors() {
+    try {
+        const sponsorsUrl = "https://ghs.vercel.app/v3/sponsors/hlohaus";
+        const response = await fetch(sponsorsUrl);
+        if (!response.ok) return [];
+        const data = await response.json();
+        data.sponsors = data.sponsors || {};
+        data.sponsors.current = data.sponsors.current || [];
+        data.sponsors.past = data.sponsors.past || [];
+        return data.sponsors.past.map(user => user.username)
+            .concat(data.sponsors.current.map(user => user.username));
+    } catch (error) {
+        console.error("Failed to fetch sponsors:", error);
+        return [];
+    }
+}
+
+/**
+ * Calculate user tier based on admin status, contributor status, sponsor status, and account age
+ * For anonymous users, checks for hash-based tier upgrade from username
+ * @param {Object} userData - User data object
+ * @param {string[]} contributors - List of contributor usernames
+ * @param {string[]} sponsors - List of sponsor usernames
+ * @returns {Promise<string>} User tier: "admin", "pro", "sponsor", "free", "anonymous", or "new"
+ */
+async function calculateUserTier(userData, contributors, sponsors) {
+    // Check admin status
+    const adminList = ADMIN_USERS[userData.provider] || [];
+    if (adminList.includes(userData.username)) {
+        return "admin";
+    }
+    
+    // Check for anonymous tier upgrade via username hash
+    const usernameHash = await calculateHashFromUsername(userData.username);
+    if (usernameHash) {
+        const upgradedTier = getUpgradedTierFromHash(usernameHash);
+        if (upgradedTier) {
+            return upgradedTier;
+        }
+    }
+
+    if (userData.provider === "github" && EXTRA_CONTRIBUTERS.includes(userData.username)) {
+        return "pro";
+    }
+
+    // Check contributor status (GitHub only)
+    if (userData.provider === "github" && contributors.includes(userData.username)) {
+        return "pro";
+    }
+    
+    // Check sponsor status (GitHub only)
+    if (userData.provider === "github" && sponsors.includes(userData.username)) {
+        return "sponsor";
+    }
+    
+    // Check account age (> 24 hours = free tier)
+    if (userData.created_at) {
+        const created = new Date(userData.created_at);
+        const now = new Date();
+        if ((now - created) > 24 * 60 * 60 * 1000) {
+            return "free";
+        }
+    }
+    
+    return "new";
+}
+  
+  // Rate limits for different user tiers (tokens and requests per window)
+var USER_TIER_LIMITS = {
+  new: {
+    tokens: { perMinute: 1e5, perHour: 3e5, perDay: 1e6 },
+    requests: { perMinute: 10, perHour: 100, perDay: 1e3 },
+    days: { perTwelveDays: 12 },
+    api_keys: 1,
+    burstMultiplier: 1.5
+  },
+  free: {
+    tokens: { perMinute: 2e5, perHour: 1e6, perDay: 5e6 },
+    requests: { perMinute: 20, perHour: 200, perDay: 2e3 },
+    days: { perTwelveDays: 12 },
+    api_keys: 3,
+    burstMultiplier: 1.5
+  },
+  sponsor: {
+    tokens: { perMinute: 1e6, perHour: 5e6, perDay: 2e7 },
+    requests: { perMinute: 100, perHour: 1e3, perDay: 1e4 },
+    days: { perTwelveDays: 12 },
+    api_keys: 10,
+    burstMultiplier: 2
+  },
+  pro: {
+    tokens: { perMinute: 1e6, perHour: 5e6, perDay: 2e7 },
+    requests: { perMinute: 100, perHour: 1e3, perDay: 1e4 },
+    days: { perTwelveDays: 12 },
+    api_keys: 10,
+    burstMultiplier: 2
+  },
+  admin: {
+    tokens: { perMinute: 1e6, perHour: 5e6, perDay: 2e7 },
+    requests: { perMinute: 100, perHour: 1e3, perDay: 1e4 },
+    days: { perTwelveDays: 12 },
+    api_keys: 10,
+    burstMultiplier: 2
+  },
+  anonymous: {
+    tokens: { perMinute: 1e6, perHour: 5e6, perDay: 1e8 },
+    requests: { perMinute: 100, perHour: 2e3, perDay: 5e4 },
+    days: { perTwelveDays: 12 },
+    burstMultiplier: 1.5
+  }
+};
+  
+  // Legacy USER_TIERS for backwards compatibility
+  const USER_TIERS = {
+    new: {
+        requests_per_day: USER_TIER_LIMITS.new.requests.perDay,
+        tokens_per_day: USER_TIER_LIMITS.new.tokens.perDay,
+        api_keys: USER_TIER_LIMITS.new.api_keys
+    },
+    free: {
+        requests_per_day: USER_TIER_LIMITS.free.requests.perDay,
+        tokens_per_day: USER_TIER_LIMITS.free.tokens.perDay,
+        api_keys: USER_TIER_LIMITS.free.api_keys
+    },
+    sponsor: {
+        requests_per_day: USER_TIER_LIMITS.sponsor.requests.perDay,
+        tokens_per_day: USER_TIER_LIMITS.sponsor.tokens.perDay,
+        api_keys: USER_TIER_LIMITS.sponsor.api_keys
+    },
+    pro: {
+        requests_per_day: USER_TIER_LIMITS.pro.requests.perDay,
+        tokens_per_day: USER_TIER_LIMITS.pro.tokens.perDay,
+        api_keys: USER_TIER_LIMITS.pro.api_keys
+    },
+    admin: {
+        requests_per_day: USER_TIER_LIMITS.admin.requests.perDay,
+        tokens_per_day: USER_TIER_LIMITS.admin.tokens.perDay,
+        api_keys: USER_TIER_LIMITS.admin.api_keys
+    },
+    anonymous: {
+        requests_per_day: USER_TIER_LIMITS.anonymous.requests.perDay,
+        tokens_per_day: USER_TIER_LIMITS.anonymous.tokens.perDay,
+        api_keys: USER_TIER_LIMITS.anonymous.api_keys
+    }
+  };
+  
+  export default {
+    async fetch(request, env, ctx) {
+        const url = new URL(request.url);
+        const pathname = url.pathname;
+  
+        // Handle CORS preflight
+        if (request.method === "OPTIONS") {
+            return new Response(null, { headers: getCorsHeaders(request) });
+        }
+  
+        try {
+            // OAuth endpoints (both /auth/ and /oauth/ paths supported)
+            if (pathname === "/members/auth/github" || pathname === "/members/oauth/github") {
+                return handleGitHubAuth(request, env, url);
+            }
+            if (pathname === "/members/auth/github/callback" || pathname === "/members/oauth/github/callback") {
+                return handleGitHubCallback(request, env, url);
+            }
+            if (pathname === "/members/auth/discord" || pathname === "/members/oauth/discord") {
+                return handleDiscordAuth(request, env, url);
+            }
+            if (pathname === "/members/auth/discord/callback" || pathname === "/members/oauth/discord/callback") {
+                return handleDiscordCallback(request, env, url);
+            }
+            if (pathname === "/members/auth/huggingface" || pathname === "/members/oauth/huggingface") {
+                return handleHuggingFaceAuth(request, env, url);
+            }
+            if (pathname === "/members/auth/huggingface/callback" || pathname === "/members/oauth/huggingface/callback") {
+                return handleHuggingFaceCallback(request, env, url);
+            }
+            if (pathname === "/members/auth/airforce" || pathname === "/members/oauth/airforce") {
+                return handleAirforceAuth(request, env, url);
+            }
+            if (pathname === "/members/auth/airforce/callback" || pathname === "/members/oauth/airforce/callback") {
+                return handleAirforceCallback(request, env, url);
+            }
+            if (pathname === "/members/auth/pollinations" || pathname === "/members/oauth/pollinations") {
+                return handlePollinationsAuth(request, env, url);
+            }
+            if (pathname === "/members/auth/pollinations/authorize" || pathname === "/members/oauth/pollinations/authorize") {
+                return handlePollinationsOAuthAuth(request, env, url);
+            }
+            if (pathname === "/members/auth/pollinations/callback" || pathname === "/members/oauth/pollinations/callback") {
+                return handlePollinationsOAuthCallback(request, env, url);
+            }
+
+            // Self-hosted OAuth server endpoints
+            if (pathname === "/members/oauth/authorize") {
+                return handleSelfOAuthAuthorize(request, env, url);
+            }
+            if (pathname === "/members/oauth/authorize/callback") {
+                return handleSelfOAuthAuthorizeCallback(request, env, url);
+            }
+            if (pathname === "/members/oauth/token") {
+                return handleSelfOAuthToken(request, env, url);
+            }
+            if (pathname === "/members/oauth/revoke") {
+                return handleSelfOAuthRevoke(request, env);
+            }
+            if (pathname === "/members/oauth/userinfo") {
+                return handleSelfOAuthUserInfo(request, env);
+            }
+
+            // User management endpoints
+            if (pathname === "/members/api/user") {
+                return handleGetUser(request, env);
+            }
+            if (pathname === "/members/api/user/update") {
+                return handleUpdateUser(request, env);
+            }
+            if (pathname === "/members/api/user/delete") {
+                return handleDeleteUser(request, env);
+            }
+            if (pathname === "/members/api/user/delete/cancel") {
+                return handleCancelDeleteUser(request, env);
+            }
+            if (pathname === "/members/api/user/unlink") {
+                return handleUnlinkProvider(request, env);
+            }
+  
+            // Anonymous tier upgrade endpoint
+            if (pathname.startsWith("/members/api/anonymous/")) {
+                return handleAnonymousTierUpgrade(pathname, request, env);
+            }
+  
+            // API Key management endpoints
+            if (pathname === "/members/api/keys") {
+                return handleListApiKeys(request, env);
+            }
+            if (pathname === "/members/api/keys/generate") {
+                return handleGenerateApiKey(request, env, ctx);
+            }
+            if (pathname === "/members/api/keys/revoke") {
+                return handleRevokeApiKey(request, env);
+            }
+            if (pathname === "/members/api/keys/revoke-by-key" || pathname === "/revoke") {
+                return handleRevokeApiKeyByKey(request, env);
+            }
+            if (pathname === "/members/api/keys/validate") {
+                return handleValidateApiKey(request, env);
+            }
+  
+            // Public recent-users feed (used by the Discord live feed bot).
+            // Returns the most recently created users (no auth required,
+            // only public fields: username, provider, tier, created_at, avatar).
+            if (pathname === "/members/api/recent-users") {
+                return handleGetRecentUsers(request, env);
+            }
+  
+            // Usage statistics endpoints
+            if (pathname === "/members/api/usage") {
+                return handleGetUsage(request, env);
+            }
+            if (pathname === "/members/api/usage/history") {
+                return handleGetUsageHistory(request, env);
+            }
+            // if (pathname === "/members/api/usage/track") {
+            //     return handleTrackUsage(request, env, ctx);
+            // }
+  
+            // Extended rate limiting endpoints
+            if (pathname === "/members/api/rate-limit") {
+                return handleGetRateLimit(request, env);
+            }
+            if (pathname === "/members/api/rate-limit/check") {
+                return handleCheckRateLimit(request, env);
+            }
+            // if (pathname === "/members/api/rate-limit/update") {
+            //     return handleUpdateRateLimit(request, env, ctx);
+            // }
+  
+            // Session management
+            if (pathname === "/members/api/logout") {
+                return handleLogout(request, env);
+            }
+            if (pathname === "/members/api/session") {
+                return handleCheckSession(request, env);
+            }
+  
+            // Conversation cloud sync endpoints
+            if (pathname === "/members/api/conversations") {
+                if (request.method === "GET") {
+                    return handleListConversations(request, env);
+                } else if (request.method === "POST") {
+                    return handleSyncConversations(request, env);
+                }
+            }
+            if (pathname === "/members/api/conversations/sync") {
+                return handleSyncConversations(request, env);
+            }
+            if (pathname.startsWith("/members/api/conversations/") && pathname !== "/members/api/conversations/" && pathname !== "/members/api/conversations/sync") {
+                const conversationId = pathname.replace("/members/api/conversations/", "");
+                if (request.method === "GET") {
+                    return handleGetConversation(request, env, conversationId);
+                } else if (request.method === "DELETE") {
+                    return handleDeleteConversation(request, env, conversationId);
+                }
+            }
+
+            if (pathname === "/members/api/jwt") {
+                return handleJwtRequest(request, env);
+            }
+
+            // Secret request endpoints (cross-device workspace secret sharing)
+            // Mirrors the Python API paths at /v1/secret/request*
+            if (pathname === "/v1/secret/request" && request.method === "POST") {
+                return handleCreateSecretRequest(request, env);
+            }
+            if (pathname === "/v1/secret/requests" && request.method === "GET") {
+                return handleListSecretRequests(request, env);
+            }
+            if (pathname === "/v1/secret/request/confirm" && request.method === "POST") {
+                return handleConfirmSecretRequest(request, env);
+            }
+            if (pathname.startsWith("/v1/secret/request/") && pathname !== "/v1/secret/request/confirm") {
+                const requestId = pathname.replace("/v1/secret/request/", "");
+                if (request.method === "GET") {
+                    return handlePollSecretRequest(request, env, requestId);
+                } else if (request.method === "DELETE") {
+                    return handleDeleteSecretRequest(request, env, requestId);
+                }
+            }
+
+            return jsonResponse({ error: "Not found" }, 404, getCorsHeaders(request));
+        } catch (error) {
+            console.error("Worker error:", error);
+            return jsonResponse({ error: "Worker error: " + error.message || "Internal server error" }, 500, getCorsHeaders(request));
+        }
+    },
+
+    /**
+     * Scheduled handler to update user tiers periodically
+     * Configure in wrangler.toml with cron trigger, e.g.:
+     * [triggers]
+     * crons = ["0 * * * *"]  # Run every hour
+     */
+    async scheduled(event, env, ctx) {
+        console.log("Starting scheduled tier update...");
+        
+        try {
+            // Fetch contributors and sponsors
+            const [contributors, sponsors] = await Promise.all([
+                fetchContributors(env),
+                fetchSponsors()
+            ]);
+            
+            console.log(`Fetched ${contributors.length} contributors and ${sponsors.length} sponsors`);
+            
+            // Iterate through all users in R2, handling pagination.
+            let listResult = await env.MEMBERS_BUCKET.list({ prefix: "users/", limit: 100 });
+            let updatedCount = 0;
+            let errorCount = 0;
+            let deletedCount = 0;
+            
+            while (listResult && Array.isArray(listResult.objects)) {
+                for (const object of listResult.objects) {
+                    try {
+                        // Skip non-JSON files
+                        if (!object.key.endsWith('.json')) continue;
+                        
+                        const userObject = await env.MEMBERS_BUCKET.get(object.key);
+                        if (!userObject) continue;
+                        
+                        const user = await userObject.json();
+
+                        // Process scheduled account deletions after the 24h grace period
+                        if (user.scheduled_deletion) {
+                            const deletionTime = new Date(user.scheduled_deletion);
+                            if (deletionTime <= new Date()) {
+                                console.log(`Deleting user ${user.username} (${user.provider}) — grace period elapsed`);
+                                await performUserDeletion(env, user);
+                                deletedCount++;
+                                continue;
+                            }
+                        }
+
+                        const newTier = await calculateUserTier(user, contributors, sponsors);
+                        
+                        if (user.tier !== newTier) {
+                            const oldTier = user.tier;
+                            user.tier = newTier;
+                            user.updated_at = new Date().toISOString();
+                            
+                            // Save to R2
+                            await env.MEMBERS_BUCKET.put(
+                                object.key,
+                                JSON.stringify(user, null, 2),
+                                { httpMetadata: { contentType: "application/json" } }
+                            );
+                            
+                            // Update KV cache
+                            await env.MEMBERS_KV.put(
+                                `user:${user.id}`,
+                                JSON.stringify(user),
+                                { expirationTtl: 3600 }
+                            );
+                            
+                            // Update API key tier in KV
+                            for (const keyData of user.api_keys || []) {
+                                const keyInfo = await env.MEMBERS_KV.get(`api_key:${keyData.key_hash}`);
+                                if (keyInfo) {
+                                    const parsed = JSON.parse(keyInfo);
+                                    parsed.tier = newTier;
+                                    await env.MEMBERS_KV.put(
+                                        `api_key:${keyData.key_hash}`,
+                                        JSON.stringify(parsed)
+                                    );
+                                }
+                            }
+                            
+                            console.log(`Updated user ${user.username} (${user.provider}): ${oldTier} -> ${newTier}`);
+                            updatedCount++;
+                        }
+                    } catch (userError) {
+                        console.error(`Error processing user ${object.key}:`, userError);
+                        errorCount++;
+                    }
+                }
+                
+                if (!listResult.truncated || !listResult.cursor) {
+                    break;
+                }
+                listResult = await env.MEMBERS_BUCKET.list({ prefix: "users/", limit: 100, cursor: listResult.cursor });
+            }
+            
+            console.log(`Scheduled tier update complete: ${updatedCount} users updated, ${deletedCount} deleted, ${errorCount} errors`);
+        } catch (error) {
+            console.error("Scheduled tier update failed:", error);
+        }
+    }
+  };
+  
+  // ============================================
+  // OAuth Handlers
+  // ============================================
+  
+  async function handleGitHubAuth(request, env, url) {
+    const state = generateState();
+    const scope = "user:email read:user";
+    const redirect = url.searchParams.get("redirect") || null;
+    const conversation = url.searchParams.get("conversation") || null;
+
+    const authUrl = new URL("https://github.com/login/oauth/authorize");
+    authUrl.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
+    authUrl.searchParams.set("redirect_uri", `${url.origin}/members/auth/github/callback`);
+    authUrl.searchParams.set("scope", scope);
+    authUrl.searchParams.set("state", state);
+  
+    // Store state in KV for verification, include redirect URL if present
+    const stateData = JSON.stringify({ provider: "github", redirect, conversation });
+    await env.MEMBERS_KV.put(`oauth_state:${state}`, stateData, { expirationTtl: 600 });
+  
+    return Response.redirect(authUrl.toString(), 302);
+  }
+  
+  async function handleGitHubCallback(request, env, url) {
+    const code = url.searchParams.get("code");
+    const state = url.searchParams.get("state");
+  
+    if (!code || !state) {
+        return redirectWithError("Missing code or state parameter");
+    }
+  
+    // Verify state and get redirect URL if present
+    const storedStateData = await env.MEMBERS_KV.get(`oauth_state:${state}`);
+    let stateData;
+    try {
+        stateData = JSON.parse(storedStateData);
+    } catch {
+        // Legacy format: just the provider string
+        stateData = { provider: storedStateData, redirect: null };
+    }
+    if (stateData.provider !== "github") {
+        return redirectWithError("Invalid state parameter");
+    }
+    await env.MEMBERS_KV.delete(`oauth_state:${state}`);
+    const externalRedirect = stateData.redirect;
+  
+    // Exchange code for access token
+    const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
+        method: "POST",
+        headers: {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            client_id: env.GITHUB_CLIENT_ID,
+            client_secret: env.GITHUB_CLIENT_SECRET,
+            code: code,
+            redirect_uri: `${url.origin}/members/auth/github/callback`
+        })
+    });
+  
+    const tokenData = await tokenResponse.json();
+    if (tokenData.error) {
+        return redirectWithError(tokenData.error_description || tokenData.error);
+    }
+  
+    // Get user info from GitHub
+    const userResponse = await fetch("https://api.github.com/user", {
+        headers: {
+            "Authorization": `Bearer ${tokenData.access_token}`,
+            "User-Agent": "G4F-Members-Worker"
+        }
+    });
+    const githubUser = await userResponse.json();
+  
+    // Get user email
+    const emailResponse = await fetch("https://api.github.com/user/emails", {
+        headers: {
+            "Authorization": `Bearer ${tokenData.access_token}`,
+            "User-Agent": "G4F-Members-Worker"
+        }
+    });
+    const emails = await emailResponse.json();
+    const primaryEmail = emails.find(e => e.primary)?.email || emails[0]?.email;
+  
+    // Create or update user
+    const user = await createOrUpdateUser(env, {
+        provider: "github",
+        username: githubUser.login,
+        name: githubUser.name || githubUser.login,
+        email: primaryEmail,
+        avatar: githubUser.avatar_url,
+        access_token: tokenData.access_token
+    });
+  
+    // Generate session token
+    const { sessionToken, expires } = await createSession(env, user.id);
+  
+    // Only the central OAuth authorize/callback hop may receive the session
+    // via redirect; everything else falls back to the native members login.
+    if (externalRedirect) {
+        try {
+            const redirectUrl = new URL(externalRedirect);
+            if (isValidRedirect(redirectUrl) && redirectUrl.pathname === "/members/oauth/authorize/callback") {
+                const authReqId = redirectUrl.searchParams.get("self_oauth_req");
+                if (authReqId) {
+                    const authReqRaw = await env.MEMBERS_KV.get(`self_oauth_req:${authReqId}`);
+                    if (authReqRaw) {
+                        const authReq = JSON.parse(authReqRaw);
+                        authReq.userId = user.id;
+                        authReq.sessionToken = sessionToken;
+                        await env.MEMBERS_KV.put(`self_oauth_req:${authReqId}`, JSON.stringify(authReq), { expirationTtl: 600 });
+                    }
+                }
+                return redirectWithSessionToExternal(request, sessionToken, user, externalRedirect, stateData.conversation, expires);
+            }
+        } catch (e) {
+            console.error("Invalid redirect URL:", e);
+        }
+    }
+
+    return redirectWithSession(request, sessionToken, user, expires);
+  }
+
+  async function handleDiscordAuth(request, env, url) {
+    const state = generateState();
+    const scope = "identify email";
+    const redirect = url.searchParams.get("redirect") || null;
+    const conversation = url.searchParams.get("conversation") || null;
+
+    const authUrl = new URL("https://discord.com/api/oauth2/authorize");
+    authUrl.searchParams.set("client_id", env.DISCORD_CLIENT_ID);
+    authUrl.searchParams.set("redirect_uri", `${url.origin}/members/auth/discord/callback`);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("scope", scope);
+    authUrl.searchParams.set("state", state);
+  
+    const stateData = JSON.stringify({ provider: "discord", redirect, conversation });
+    await env.MEMBERS_KV.put(`oauth_state:${state}`, stateData, { expirationTtl: 600 });
+  
+    return Response.redirect(authUrl.toString(), 302);
+  }
+  
+  async function handleDiscordCallback(request, env, url) {
+    const code = url.searchParams.get("code");
+    const state = url.searchParams.get("state");
+  
+    if (!code || !state) {
+        return redirectWithError("Missing code or state parameter");
+    }
+  
+    const storedStateData = await env.MEMBERS_KV.get(`oauth_state:${state}`);
+    let stateData;
+    try {
+        stateData = JSON.parse(storedStateData);
+    } catch {
+        stateData = { provider: storedStateData, redirect: null };
+    }
+    if (stateData.provider !== "discord") {
+        return redirectWithError("Invalid state parameter");
+    }
+    await env.MEMBERS_KV.delete(`oauth_state:${state}`);
+    const externalRedirect = stateData.redirect;
+  
+    // Exchange code for access token
+    const tokenResponse = await fetch("https://discord.com/api/oauth2/token", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+            client_id: env.DISCORD_CLIENT_ID,
+            client_secret: env.DISCORD_CLIENT_SECRET,
+            grant_type: "authorization_code",
+            code: code,
+            redirect_uri: `${url.origin}/members/auth/discord/callback`
+        })
+    });
+  
+    const tokenData = await tokenResponse.json();
+    if (tokenData.error) {
+        return redirectWithError(tokenData.error_description || tokenData.error);
+    }
+  
+    // Get user info from Discord
+    const userResponse = await fetch("https://discord.com/api/users/@me", {
+        headers: {
+            "Authorization": `Bearer ${tokenData.access_token}`
+        }
+    });
+    const discordUser = await userResponse.json();
+  
+    const user = await createOrUpdateUser(env, {
+        provider: "discord",
+        username: discordUser.username,
+        name: discordUser.global_name || discordUser.username,
+        email: discordUser.email,
+        avatar: discordUser.avatar 
+            ? `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.png`
+            : null,
+        access_token: tokenData.access_token
+    });
+  
+    const { sessionToken, expires } = await createSession(env, user.id);
+  
+    // Only the central OAuth authorize/callback hop may receive the session
+    // via redirect; everything else falls back to the native members login.
+    if (externalRedirect) {
+        try {
+            const redirectUrl = new URL(externalRedirect);
+            if (isValidRedirect(redirectUrl) && redirectUrl.pathname === "/members/oauth/authorize/callback") {
+                const authReqId = redirectUrl.searchParams.get("self_oauth_req");
+                if (authReqId) {
+                    const authReqRaw = await env.MEMBERS_KV.get(`self_oauth_req:${authReqId}`);
+                    if (authReqRaw) {
+                        const authReq = JSON.parse(authReqRaw);
+                        authReq.userId = user.id;
+                        authReq.sessionToken = sessionToken;
+                        await env.MEMBERS_KV.put(`self_oauth_req:${authReqId}`, JSON.stringify(authReq), { expirationTtl: 600 });
+                    }
+                }
+                return redirectWithSessionToExternal(request, sessionToken, user, externalRedirect, stateData.conversation, expires);
+            }
+        } catch (e) {
+            console.error("Invalid redirect URL:", e);
+        }
+    }
+
+    return redirectWithSession(request, sessionToken, user, expires);
+  }
+
+  async function handleHuggingFaceAuth(request, env, url) {
+    const user = await authenticateRequest(request, env);
+    const state = generateState();
+    const scope = "inference-api";
+    const redirect = url.searchParams.get("redirect") || null;
+    const conversation = url.searchParams.get("conversation") || null;
+
+    const authUrl = new URL("https://huggingface.co/oauth/authorize");
+    authUrl.searchParams.set("client_id", env.HUGGINGFACE_CLIENT_ID);
+    authUrl.searchParams.set("redirect_uri", `${url.origin}/members/auth/huggingface/callback`);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("scope", scope);
+    authUrl.searchParams.set("state", state);
+  
+    const stateData = JSON.stringify({ provider: "huggingface", redirect, conversation, user: getSafeUser(user) });
+    await env.MEMBERS_KV.put(`oauth_state:${state}`, stateData, { expirationTtl: 600 });
+  
+    return Response.redirect(authUrl.toString(), 302);
+  }
+  
+  async function handleHuggingFaceCallback(request, env, url) {
+    const code = url.searchParams.get("code");
+    const state = url.searchParams.get("state");
+  
+    if (!code || !state) {
+        return redirectWithError("Missing code or state parameter");
+    }
+  
+    const storedStateData = await env.MEMBERS_KV.get(`oauth_state:${state}`);
+    let stateData;
+    try {
+        stateData = JSON.parse(storedStateData);
+    } catch {
+        stateData = { provider: storedStateData, redirect: null };
+    }
+    if (stateData.provider !== "huggingface") {
+        return redirectWithError("Invalid state parameter");
+    }
+    await env.MEMBERS_KV.delete(`oauth_state:${state}`);
+    const externalRedirect = stateData.redirect;
+  
+    // Exchange code for access token
+    const tokenResponse = await fetch("https://huggingface.co/oauth/token", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+            client_id: env.HUGGINGFACE_CLIENT_ID,
+            client_secret: env.HUGGINGFACE_CLIENT_SECRET,
+            grant_type: "authorization_code",
+            code: code,
+            redirect_uri: `${url.origin}/members/auth/huggingface/callback`
+        })
+    });
+  
+    const tokenData = await tokenResponse.json();
+    if (tokenData.error) {
+        return redirectWithError(tokenData.error_description || tokenData.error);
+    }
+  
+    // Get user info from HuggingFace
+    const userResponse = await fetch("https://huggingface.co/api/whoami-v2", {
+        headers: {
+            "Authorization": `Bearer ${tokenData.access_token}`
+        }
+    });
+    const hfUser = await userResponse.json();
+  
+    const user = await createOrUpdateUser(env, {
+        provider: stateData.user?.provider || "huggingface",
+        username: stateData.user?.username || hfUser.name,
+        name: stateData.user?.name || hfUser.fullname || hfUser.name,
+        email: stateData.user?.email || hfUser.email,
+        avatar: stateData.user?.avatar || `https://huggingface.co${hfUser.avatarUrl}`,
+        huggingface: {
+            ...hfUser,
+            ...tokenData,
+            expires: Math.floor(Date.now() / 1000) + tokenData.expires_in
+        }
+    });
+  
+    const { sessionToken, expires } = await createSession(env, user.id);
+  
+    // Only the central OAuth authorize/callback hop may receive the session
+    // via redirect; everything else falls back to the native members login.
+    if (externalRedirect) {
+        try {
+            const redirectUrl = new URL(externalRedirect);
+            if (isValidRedirect(redirectUrl) && redirectUrl.pathname === "/members/oauth/authorize/callback") {
+                const authReqId = redirectUrl.searchParams.get("self_oauth_req");
+                if (authReqId) {
+                    const authReqRaw = await env.MEMBERS_KV.get(`self_oauth_req:${authReqId}`);
+                    if (authReqRaw) {
+                        const authReq = JSON.parse(authReqRaw);
+                        authReq.userId = user.id;
+                        authReq.sessionToken = sessionToken;
+                        await env.MEMBERS_KV.put(`self_oauth_req:${authReqId}`, JSON.stringify(authReq), { expirationTtl: 600 });
+                    }
+                }
+                return redirectWithSessionToExternal(request, sessionToken, user, externalRedirect, tokenData.conversation, expires);
+            }
+        } catch (e) {
+            console.error("Invalid redirect URL:", e);
+        }
+    }
+
+    return redirectWithSession(request, sessionToken, user, expires);
+  }
+
+  async function handleAirforceAuth(request, env, url) {
+    const user = await authenticateRequest(request, env);
+    const state = generateState();
+    const scope = "profile chat images";
+    const redirect = url.searchParams.get("redirect") || null;
+    const conversation = url.searchParams.get("conversation") || null;
+    const codeVerifier = generateCodeVerifier();
+    const codeChallenge = await generateCodeChallenge(codeVerifier);
+
+    const authUrl = new URL("https://api.airforce/oauth/authorize");
+    authUrl.searchParams.set("client_id", env.AIRFORCE_CLIENT_ID);
+    authUrl.searchParams.set("redirect_uri", `${url.origin}/members/auth/airforce/callback`);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("scope", scope);
+    authUrl.searchParams.set("state", state);
+    authUrl.searchParams.set("code_challenge", codeChallenge);
+    authUrl.searchParams.set("code_challenge_method", "S256");
+
+    const stateData = JSON.stringify({ provider: "airforce", redirect, conversation, codeVerifier, user: getSafeUser(user) });
+    await env.MEMBERS_KV.put(`oauth_state:${state}`, stateData, { expirationTtl: 600 });
+
+    return Response.redirect(authUrl.toString(), 302);
+  }
+
+  async function handleAirforceCallback(request, env, url) {
+    const code = url.searchParams.get("code");
+    const state = url.searchParams.get("state");
+    const error = url.searchParams.get("error");
+
+    if (error) {
+        return redirectWithError(error);
+    }
+
+    if (!code || !state) {
+        return redirectWithError("Missing code or state parameter");
+    }
+
+    const storedStateData = await env.MEMBERS_KV.get(`oauth_state:${state}`);
+    let stateData;
+    try {
+        stateData = JSON.parse(storedStateData);
+    } catch {
+        stateData = { provider: storedStateData, redirect: null };
+    }
+    if (stateData.provider !== "airforce" || !stateData.codeVerifier) {
+        return redirectWithError("Invalid state parameter");
+    }
+    await env.MEMBERS_KV.delete(`oauth_state:${state}`);
+    const externalRedirect = stateData.redirect;
+
+    const tokenResponse = await fetch("https://api.airforce/oauth/token", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        },
+        body: new URLSearchParams({
+            client_id: env.AIRFORCE_CLIENT_ID,
+            client_secret: env.AIRFORCE_CLIENT_SECRET,
+            grant_type: "authorization_code",
+            code,
+            redirect_uri: `${url.origin}/members/auth/airforce/callback`,
+            code_verifier: stateData.codeVerifier
+        })
+    });
+
+    const tokenData = await tokenResponse.json();
+    if (!tokenResponse.ok || tokenData.error || !tokenData.access_token) {
+        return redirectWithError(tokenData.error_description || tokenData.error || "Failed to exchange authorization code");
+    }
+
+    const userResponse = await fetch("https://api.airforce/oauth/userinfo", {
+        headers: {
+            "Authorization": `Bearer ${tokenData.access_token}`,
+            "Accept": "application/json"
+        }
+    });
+    const airforceUser = await userResponse.json();
+
+    if (!userResponse.ok) {
+        return redirectWithError(airforceUser.error_description || airforceUser.error || "Failed to fetch user profile");
+    }
+
+    let provider;
+    let username;
+
+    if (stateData.user) {
+        provider = stateData.user.provider;
+        username = stateData.user.username;
+    } else if (airforceUser.github_username) {
+        provider = "github";
+        username = airforceUser.github_username;
+    } else if (airforceUser.discord_username) {
+        provider = "discord";
+        username = airforceUser.discord_username;
+    } else {
+        provider = "airforce";
+        username = airforceUser.username;
+    }
+
+    const user = await createOrUpdateUser(env, {
+        provider,
+        username,
+        name: stateData.user?.name || airforceUser.name || username,
+        email: stateData.user?.email || airforceUser.email,
+        avatar: stateData.user?.avatar || airforceUser.picture || airforceUser.avatar_url || airforceUser.avatar,
+        airforce: {
+            ...airforceUser,
+            ...tokenData,
+            expires: Math.floor(Date.now() / 1000) + tokenData.expires_in
+        }
+    });
+
+    const { sessionToken, expires } = await createSession(env, user.id);
+
+    // Only the central OAuth authorize/callback hop may receive the session
+    // via redirect; everything else falls back to the native members login.
+    if (externalRedirect) {
+        try {
+            const redirectUrl = new URL(externalRedirect);
+            if (isValidRedirect(redirectUrl) && redirectUrl.pathname === "/members/oauth/authorize/callback") {
+                const authReqId = redirectUrl.searchParams.get("self_oauth_req");
+                if (authReqId) {
+                    const authReqRaw = await env.MEMBERS_KV.get(`self_oauth_req:${authReqId}`);
+                    if (authReqRaw) {
+                        const authReq = JSON.parse(authReqRaw);
+                        authReq.userId = user.id;
+                        authReq.sessionToken = sessionToken;
+                        await env.MEMBERS_KV.put(`self_oauth_req:${authReqId}`, JSON.stringify(authReq), { expirationTtl: 600 });
+                    }
+                }
+                return redirectWithSessionToExternal(request, sessionToken, user, externalRedirect, stateData.conversation, expires);
+            }
+        } catch (e) {
+            console.error("Invalid redirect URL:", e);
+        }
+    }
+
+    return redirectWithSession(request, sessionToken, user, expires);
+  }
+
+  /**
+   * Fetch user profile from Pollinations API.
+   * @param {string} apiKey - Pollinations API key
+   * @returns {Promise<Object|null>} Profile object or null on failure
+   */
+  async function fetchPollinationsProfile(apiKey) {
+      let expires;
+      try {
+          const response = await fetch("https://gen.pollinations.ai/account/key", {
+              headers: {
+                  "Authorization": `Bearer ${apiKey}`
+              }
+          });
+          const key_data = response.ok ? (await response.json()) : null;
+          if (key_data.expiresAt) {
+              expires = Math.floor(Date.parse(key_data.expiresAt)/1000);
+          }
+      } catch (e) {}
+      try {
+          const response = await fetch("https://gen.pollinations.ai/account/profile", {
+              headers: {
+                  "Authorization": `Bearer ${apiKey}`
+              }
+          });
+          if (!response.ok) return null;
+          return {...await response.json(), expires}
+      } catch (e) {
+          console.error("Failed to fetch Pollinations profile:", e);
+          return null;
+      }
+  }
+
+  /**
+   * POST /members/auth/pollinations
+   * Authenticate using a Pollinations API key.
+   * Pollinations uses GitHub as identity provider, so the profile response
+   * contains GitHub username/id which is used to create or link the account.
+   *
+   * Body: { "api_key": "<pollinations_api_key>" }
+   * OR:   Authorization: Bearer <pollinations_api_key>
+   */
+  async function handlePollinationsAuth(request, env, url) {
+      if (request.method !== "POST") {
+          return jsonResponse({ error: "Method not allowed" }, 405, getCorsHeaders(request));
+      }
+  
+      // Accept key from body or Authorization header
+      let pollinationsKey;
+      try {
+          const body = await request.json();
+          pollinationsKey = body.api_key;
+      } catch {
+          // ignore JSON parse errors
+      }
+      if (!pollinationsKey) {
+          pollinationsKey = request.headers.get("Authorization")?.replace("Bearer ", "");
+      }
+      if (!pollinationsKey) {
+          return jsonResponse({ error: "api_key is required" }, 400, getCorsHeaders(request));
+      }
+  
+      // Validate key by fetching the Pollinations profile
+      const profile = await fetchPollinationsProfile(pollinationsKey);
+      if (!profile) {
+          return jsonResponse({ error: "Invalid Pollinations API key" }, 401, getCorsHeaders(request));
+      }
+  
+      // Pollinations profile includes GitHub identity fields
+      const githubUsername = profile.githubUsername;
+      if (!githubUsername) {
+          return jsonResponse({ error: "Pollinations profile missing GitHub identity", profile}, 502, getCorsHeaders(request));
+      }
+  
+      // Create or update the user, linked to the GitHub identity
+      const user = await createOrUpdateUser(env, {
+          provider: "github",
+          username: githubUsername,
+          name: profile.name || githubUsername,
+          email: profile.email || null,
+          avatar: profile.image || null,
+          pollinations: {...profile, api_key: pollinationsKey}
+      });
+  
+      const { sessionToken, expires } = await createSession(env, user.id);
+  
+      // Return JSON session for programmatic use
+      const safeUser = getSafeUser(user);
+  
+      const cookieExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toUTCString();
+    const cookie = `g4f_session=${sessionToken}; domain=g4f.space; Path=/; Expires=${cookieExpiry}; SameSite=None; Secure`;
+  
+      return new Response(JSON.stringify({ session: sessionToken, user: safeUser }), {
+          status: 200,
+          headers: {
+              "Content-Type": "application/json",
+              "Set-Cookie": cookie,
+              ...getCorsHeaders(request)
+          }
+      });
+  }
+
+  /**
+   * GET /members/auth/pollinations/authorize
+   * Redirects the user to Pollinations' OAuth 2.0 authorization endpoint
+   * using the authorization-code flow with PKCE (S256).
+   *
+   * Requires the POLLINATIONS_CLIENT_ID env var (a pk_... publishable key).
+   * Supports the same "redirect" and "conversation" params as the other providers.
+   */
+  async function handlePollinationsOAuthAuth(request, env, url) {
+      if (!env.POLLINATIONS_CLIENT_ID) {
+          return redirectWithError("Pollinations OAuth is not configured (missing POLLINATIONS_CLIENT_ID)");
+      }
+
+      const state = generateState();
+      const scope = "profile usage";
+      const redirect = url.searchParams.get("redirect") || null;
+      const conversation = url.searchParams.get("conversation") || null;
+      const codeVerifier = generateCodeVerifier();
+      const codeChallenge = await generateCodeChallenge(codeVerifier);
+
+      const authUrl = new URL("https://enter.pollinations.ai/authorize");
+      authUrl.searchParams.set("response_type", "code");
+      authUrl.searchParams.set("client_id", env.POLLINATIONS_CLIENT_ID);
+      authUrl.searchParams.set("redirect_uri", `${url.origin}/members/auth/pollinations/callback`);
+      authUrl.searchParams.set("scope", scope);
+      authUrl.searchParams.set("state", state);
+      authUrl.searchParams.set("code_challenge", codeChallenge);
+      authUrl.searchParams.set("code_challenge_method", "S256");
+
+      const stateData = JSON.stringify({ provider: "pollinations", redirect, conversation, codeVerifier });
+      await env.MEMBERS_KV.put(`oauth_state:${state}`, stateData, { expirationTtl: 600 });
+
+      return Response.redirect(authUrl.toString(), 302);
+  }
+
+  /**
+   * GET /members/auth/pollinations/callback
+   * Handles the OAuth 2.0 authorization-code callback from Pollinations.
+   * Exchanges the code for an access_token (sk_...), fetches the userinfo,
+   * and creates/updates the g4f user account.
+   */
+  async function handlePollinationsOAuthCallback(request, env, url) {
+      const code = url.searchParams.get("code");
+      const state = url.searchParams.get("state");
+      const error = url.searchParams.get("error");
+
+      if (error) {
+          return redirectWithError(error);
+      }
+
+      if (!code || !state) {
+          return redirectWithError("Missing code or state parameter");
+      }
+
+      const storedStateData = await env.MEMBERS_KV.get(`oauth_state:${state}`);
+      let stateData;
+      try {
+          stateData = JSON.parse(storedStateData);
+      } catch {
+          stateData = { provider: storedStateData, redirect: null };
+      }
+      if (stateData.provider !== "pollinations" || !stateData.codeVerifier) {
+          return redirectWithError("Invalid state parameter");
+      }
+      await env.MEMBERS_KV.delete(`oauth_state:${state}`);
+      const externalRedirect = stateData.redirect;
+
+      // Exchange the authorization code for an access token
+      const tokenResponse = await fetch("https://enter.pollinations.ai/api/oauth/token", {
+          method: "POST",
+          headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+              "Accept": "application/json"
+          },
+          body: new URLSearchParams({
+              grant_type: "authorization_code",
+              code,
+              client_id: env.POLLINATIONS_CLIENT_ID,
+              redirect_uri: `${url.origin}/members/auth/pollinations/callback`,
+              code_verifier: stateData.codeVerifier
+          })
+      });
+
+      const tokenData = await tokenResponse.json();
+      if (!tokenResponse.ok || tokenData.error || !tokenData.access_token) {
+          return redirectWithError(tokenData.error_description || tokenData.error || "Failed to exchange authorization code");
+      }
+
+      // Fetch user info from Pollinations userinfo endpoint
+      const userResponse = await fetch("https://enter.pollinations.ai/api/oauth/userinfo", {
+          headers: {
+              "Authorization": `Bearer ${tokenData.access_token}`,
+              "Accept": "application/json"
+          }
+      });
+      const pollinationsUser = await userResponse.json();
+
+      if (!userResponse.ok) {
+          return redirectWithError(pollinationsUser.error_description || pollinationsUser.error || "Failed to fetch user profile");
+      }
+
+      // Pollinations uses GitHub as identity provider; userinfo returns
+      // sub (user-id), preferred_username, name, email, picture
+      const username = pollinationsUser.preferred_username || pollinationsUser.sub;
+      if (!username) {
+          return redirectWithError("Pollinations profile missing username");
+      }
+
+      const user = await createOrUpdateUser(env, {
+          provider: "github", // Pollinations identity is backed by GitHub
+          username,
+          name: pollinationsUser.name || username,
+          email: pollinationsUser.email || null,
+          avatar: pollinationsUser.picture || null,
+          pollinations: {
+              ...pollinationsUser,
+              ...tokenData,
+              expires: Math.floor(Date.now() / 1000) + (tokenData.expires_in || 604800)
+          }
+      });
+
+      const { sessionToken, expires } = await createSession(env, user.id);
+
+      // Only the central OAuth authorize/callback hop may receive the session
+      // via redirect; everything else falls back to the native members login.
+      if (externalRedirect) {
+          try {
+              const redirectUrl = new URL(externalRedirect);
+              if (isValidRedirect(redirectUrl) && redirectUrl.pathname === "/members/oauth/authorize/callback") {
+                  const authReqId = redirectUrl.searchParams.get("self_oauth_req");
+                  if (authReqId) {
+                      const authReqRaw = await env.MEMBERS_KV.get(`self_oauth_req:${authReqId}`);
+                      if (authReqRaw) {
+                          const authReq = JSON.parse(authReqRaw);
+                          authReq.userId = user.id;
+                          authReq.sessionToken = sessionToken;
+                          await env.MEMBERS_KV.put(`self_oauth_req:${authReqId}`, JSON.stringify(authReq), { expirationTtl: 600 });
+                      }
+                  }
+                  return redirectWithSessionToExternal(request, sessionToken, user, externalRedirect, stateData.conversation, expires);
+              }
+          } catch (e) {
+              console.error("Invalid redirect URL:", e);
+          }
+      }
+
+      return redirectWithSession(request, sessionToken, user, expires);
+  }
+  
+  // ============================================
+  // Self-hosted OAuth Server
+  // ============================================
+
+  /**
+   * GET /members/oauth/authorize
+   *
+   * Standard OAuth 2.0 authorization endpoint. Third-party clients redirect
+   * users here to log in with their g4f.dev account.
+   *
+   * Required query params:
+   *   response_type=code
+   *   client_id=<registered_client_id>
+   *   redirect_uri=<pre-registered redirect URI>
+   *
+   * Optional:
+   *   state=<opaque string echoed back>
+   *   scope=<space-separated scopes, currently ignored>
+   *   code_challenge + code_challenge_method=S256  (PKCE)
+   *
+   * Flow:
+   *  - If the user already has a valid g4f_session cookie, immediately issue
+   *    a code and redirect back.
+   *  - Otherwise, render a minimal login-chooser page that lets the user pick
+   *    a provider (GitHub / Discord / HuggingFace / Airforce).  Each link
+   *    kicks off the corresponding provider flow with an extra "oauth_state"
+   *    param that ties it back to this authorization request.
+   */
+  async function handleSelfOAuthAuthorize(request, env, url) {
+      const responseType = url.searchParams.get("response_type");
+      const clientId = url.searchParams.get("client_id");
+      const redirectUri = url.searchParams.get("redirect_uri");
+      const state = url.searchParams.get("state") || "";
+      const codeChallenge = url.searchParams.get("code_challenge") || null;
+      const codeChallengeMethod = url.searchParams.get("code_challenge_method") || null;
+
+      // Validate required parameters
+      if (responseType !== "code") {
+          return jsonResponse({ error: "unsupported_response_type" }, 400, getCorsHeaders(request));
+      }
+      if (!clientId) {
+          return jsonResponse({ error: "invalid_request", error_description: "client_id is required" }, 400, getCorsHeaders(request));
+      }
+      if (!redirectUri) {
+          return jsonResponse({ error: "invalid_request", error_description: "redirect_uri is required" }, 400, getCorsHeaders(request));
+      }
+
+      // Look up registered client
+      const client = await getSelfOAuthClient(env, clientId);
+      if (!client) {
+          return jsonResponse({ error: "invalid_client", error_description: "Unknown client_id" }, 401, getCorsHeaders(request));
+      }
+
+      // Validate redirect_uri
+      if (!client.redirect_uris.includes(redirectUri) && !isValidRedirect(redirectUri)) {
+          return jsonResponse({ error: "invalid_request", error_description: "redirect_uri mismatch" }, 400, getCorsHeaders(request));
+      }
+
+      // Pending authorization context stored in KV
+      const authRequestId = generateState();
+      const authRequest = { clientId, redirectUri, state, codeChallenge, codeChallengeMethod };
+      await env.MEMBERS_KV.put(
+          `self_oauth_req:${authRequestId}`,
+          JSON.stringify(authRequest),
+          { expirationTtl: 600 } // 10 minutes
+      );
+
+      // If the user already has a session, skip the login page
+      const user = await authenticateRequest(request, env);
+      if (user) {
+          return issueSelfOAuthCode(env, authRequestId, authRequest, user);
+      }
+
+      // Render a login-chooser page
+      const base = `${url.origin}/members`;
+      const callbackUrl = `${url.origin}/members/oauth/authorize/callback?self_oauth_req=${authRequestId}`;
+      const q = `?redirect=${encodeURIComponent(callbackUrl)}`;
+
+      const clientName = escapeHtml(client.name || clientId);
+
+      // Provider button definitions (label, css class, href suffix, inner HTML)
+      const PROVIDER_BUTTONS = {
+          github: {
+              label: "Continue with GitHub",
+              cls: "github",
+              href: `${base}/auth/github${q}`,
+              icon: `<svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>`
+          },
+          discord: {
+              label: "Continue with Discord",
+              cls: "discord",
+              href: `${base}/auth/discord${q}`,
+              icon: `<svg width="18" height="18" viewBox="0 0 127.14 96.36" fill="currentColor"><path d="M107.7 8.07A105.15 105.15 0 0081.47 0a72.06 72.06 0 00-3.36 6.83 97.68 97.68 0 00-29.11 0A72.37 72.37 0 0045.64 0a105.89 105.89 0 00-26.25 8.09C2.79 32.65-1.71 56.6.54 80.21a105.73 105.73 0 0032.17 16.15 77.7 77.7 0 006.89-11.11 68.42 68.42 0 01-10.85-5.18c.91-.66 1.8-1.34 2.66-2a75.57 75.57 0 0064.32 0c.87.71 1.76 1.39 2.66 2a68.68 68.68 0 01-10.87 5.19 77 77 0 006.89 11.1 105.25 105.25 0 0032.19-16.14c2.64-27.38-4.51-51.11-18.9-72.15zM42.45 65.69C36.18 65.69 31 60 31 53s5-12.74 11.43-12.74S54 46 53.89 53s-5.05 12.69-11.44 12.69zm42.24 0C78.41 65.69 73.25 60 73.25 53s5-12.74 11.44-12.74S96.23 46 96.12 53s-5.04 12.69-11.43 12.69z"/></svg>`
+          },
+          huggingface: {
+              label: "Continue with HuggingFace",
+              cls: "huggingface",
+              href: `${base}/auth/huggingface${q}`,
+              icon: "🤗"
+          },
+          airforce: {
+              label: "Continue with Airforce",
+              cls: "airforce",
+              href: `${base}/auth/airforce${q}`,
+              icon: "✈️"
+          },
+          pollinations: {
+              label: "Continue with Pollinations",
+              cls: "pollinations",
+              href: `${base}/auth/pollinations/authorize${q}`,
+              icon: "🌻"
+          }
+      };
+
+      // Determine which providers to show.
+      // client.provider can be a string (single provider) or an array.
+      // When omitted, all providers are shown.
+      let providersToShow = Object.keys(PROVIDER_BUTTONS);
+      if (client.provider) {
+          const requested = Array.isArray(client.provider) ? client.provider : [client.provider];
+          providersToShow = requested.filter(p => PROVIDER_BUTTONS[p]);
+          if (providersToShow.length === 0) {
+              return jsonResponse({ error: "invalid_client", error_description: "Client configured with no valid providers" }, 500, getCorsHeaders(request));
+          }
+      }
+
+      const buttonsHtml = providersToShow.map(p => {
+          const b = PROVIDER_BUTTONS[p];
+          return `    <a class="btn ${b.cls}" href="${b.href}">
+      ${b.icon}
+      ${b.label}
+    </a>`;
+      }).join("\n");
+
+      const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in to ${clientName} — G4F</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
+      color: #c9d1d9;
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 40px;
+      max-width: 400px;
+      width: 90%;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      text-align: center;
+    }
+    h1 { font-size: 1.3rem; color: #f0f6fc; margin-bottom: 8px; }
+    .sub { font-size: 0.85rem; color: #8b949e; margin-bottom: 28px; }
+    .btn {
+      display: flex; align-items: center; justify-content: center; gap: 10px;
+      width: 100%;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      text-decoration: none;
+      color: #fff;
+      margin-bottom: 12px;
+      transition: opacity 0.2s;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn.github { background: #238636; }
+    .btn.discord { background: #5865f2; }
+    .btn.huggingface { background: #ff9d00; color: #000; }
+    .btn.airforce { background: #0a84ff; }
+    .btn.pollinations { background: #f59e0b; color: #000; }
+    .divider { margin: 8px 0 20px; font-size: 0.75rem; color: #484f58; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Sign in to G4F</h1>
+    <p class="sub">to continue to <strong>${clientName}</strong></p>
+${buttonsHtml}
+    <div class="divider">By signing in you agree to G4F's terms of service</div>
+  </div>
+</body>
+</html>`;
+
+      return new Response(html, {
+          status: 200,
+          headers: { "Content-Type": "text/html; charset=utf-8", ...getCorsHeaders(request) }
+      });
+  }
+
+  /**
+   * GET /members/oauth/authorize/callback
+   *
+   * Internal redirect target used by the login-chooser page above.
+   * After a provider's callback sets the g4f_session cookie and redirects here,
+   * we authenticate the now-logged-in user and complete the authorization flow.
+   */
+  async function handleSelfOAuthAuthorizeCallback(request, env, url) {
+      const authRequestId = url.searchParams.get("self_oauth_req");
+      if (!authRequestId) {
+          return jsonResponse({ error: "invalid_request", error_description: "Missing self_oauth_req" }, 400, getCorsHeaders(request));
+      }
+
+      const authRequestRaw = await env.MEMBERS_KV.get(`self_oauth_req:${authRequestId}`);
+      if (!authRequestRaw) {
+          return jsonResponse({ error: "invalid_request", error_description: "Authorization request expired or not found" }, 400, getCorsHeaders(request));
+      }
+
+      const authRequest = JSON.parse(authRequestRaw);
+
+      let user = await authenticateRequest(request, env);
+      const sessionToken = url.searchParams.get("session") || authRequest.sessionToken;
+
+      if (!user && sessionToken) {
+          const sessionData = await env.MEMBERS_KV.get(`session:${sessionToken}`);
+          if (sessionData) {
+              const session = JSON.parse(sessionData);
+              if (new Date(session.expires_at) > new Date()) {
+                  user = await getUser(env, session.user_id);
+              }
+          }
+      }
+
+      if (!user && authRequest.userId) {
+          user = await getUser(env, authRequest.userId);
+      }
+
+      if (!user) {
+          // Not yet authenticated — redirect back to the authorize page
+          const authorizeUrl = new URL(`${url.origin}/members/oauth/authorize`);
+          authorizeUrl.searchParams.set("response_type", "code");
+          authorizeUrl.searchParams.set("client_id", authRequest.clientId);
+          authorizeUrl.searchParams.set("redirect_uri", authRequest.redirectUri);
+          if (authRequest.state) authorizeUrl.searchParams.set("state", authRequest.state);
+          if (authRequest.codeChallenge) {
+              authorizeUrl.searchParams.set("code_challenge", authRequest.codeChallenge);
+              authorizeUrl.searchParams.set("code_challenge_method", authRequest.codeChallengeMethod);
+          }
+          return Response.redirect(authorizeUrl.toString(), 302);
+      }
+
+      return issueSelfOAuthCode(env, authRequestId, authRequest, user, sessionToken);
+  }
+
+  /**
+   * Issue an authorization code and redirect back to the client's redirect_uri.
+   */
+  async function issueSelfOAuthCode(env, authRequestId, authRequest, user, sessionToken = null) {
+      const code = generateState(); // cryptographically random 64-char hex string
+      const codeData = {
+          userId: user.id,
+          clientId: authRequest.clientId,
+          redirectUri: authRequest.redirectUri,
+          codeChallenge: authRequest.codeChallenge || null,
+          codeChallengeMethod: authRequest.codeChallengeMethod || null,
+          issuedAt: Date.now()
+      };
+
+      await env.MEMBERS_KV.put(
+          `self_oauth_code:${code}`,
+          JSON.stringify(codeData),
+          { expirationTtl: 120 } // 2 minutes — code must be exchanged quickly
+      );
+
+      // Clean up the pending authorization request
+      await env.MEMBERS_KV.delete(`self_oauth_req:${authRequestId}`);
+
+      const redirect = new URL(authRequest.redirectUri);
+      redirect.searchParams.set("code", code);
+      if (authRequest.state) redirect.searchParams.set("state", authRequest.state);
+
+      const headers = {
+          "Location": redirect.toString()
+      };
+      if (sessionToken) {
+          const cookieExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toUTCString();
+          headers["Set-Cookie"] = `g4f_session=${sessionToken}; domain=g4f.space; Path=/; Expires=${cookieExpiry}; SameSite=None; Secure`;
+      }
+
+      return new Response(null, {
+          status: 302,
+          headers
+      });
+  }
+
+  /**
+   * POST /members/oauth/token
+   *
+   * Standard OAuth 2.0 token endpoint. Supports:
+   *   grant_type=authorization_code  — exchange a code for an access token
+   *   grant_type=refresh_token       — not supported (stateless sessions)
+   *   grant_type=client_credentials  — issue a token for the client itself
+   *
+   * Returns a JSON body compatible with RFC 6749 §5.1:
+   *   { access_token, token_type, expires_in, scope }
+   *
+   * The issued access_token is a g4f session token that can be used in
+   *   Authorization: Bearer <access_token>
+   * on all other /members/api/* endpoints.
+   */
+  async function handleSelfOAuthToken(request, env, url) {
+      if (request.method !== "POST") {
+          return jsonResponse({ error: "method_not_allowed" }, 405, getCorsHeaders(request));
+      }
+
+      // Parse body — accept both application/json and application/x-www-form-urlencoded
+      let params = {};
+      const contentType = request.headers.get("Content-Type") || "";
+      try {
+          if (contentType.includes("application/json")) {
+              params = await request.json();
+          } else {
+              const form = await request.formData();
+              for (const [k, v] of form.entries()) params[k] = v;
+          }
+      } catch {
+          return jsonResponse({ error: "invalid_request", error_description: "Could not parse request body" }, 400, getCorsHeaders(request));
+      }
+
+      const grantType = params.grant_type;
+      const clientId = params.client_id;
+      const clientSecret = params.client_secret;
+
+      if (!clientId || !clientSecret) {
+          return jsonResponse({ error: "invalid_client", error_description: "client_id and client_secret are required" }, 401, getCorsHeaders(request));
+      }
+
+      const client = await getSelfOAuthClient(env, clientId);
+      if (!client || client.secret !== clientSecret) {
+          return jsonResponse({ error: "invalid_client", error_description: "Invalid client credentials" }, 401, getCorsHeaders(request));
+      }
+
+      // ── authorization_code grant ───────────────────────────────────────────
+      if (grantType === "authorization_code") {
+          const code = params.code;
+          const redirectUri = params.redirect_uri;
+          const codeVerifier = params.code_verifier || null;
+
+          if (!code || !redirectUri) {
+              return jsonResponse({ error: "invalid_request", error_description: "code and redirect_uri are required" }, 400, getCorsHeaders(request));
+          }
+
+          const codeDataRaw = await env.MEMBERS_KV.get(`self_oauth_code:${code}`);
+          if (!codeDataRaw) {
+              return jsonResponse({ error: "invalid_grant", error_description: "Authorization code expired or not found" }, 400, getCorsHeaders(request));
+          }
+
+          const codeData = JSON.parse(codeDataRaw);
+
+          // Verify binding claims
+          if (codeData.clientId !== clientId) {
+              return jsonResponse({ error: "invalid_grant", error_description: "code was issued to a different client" }, 400, getCorsHeaders(request));
+          }
+          if (codeData.redirectUri !== redirectUri) {
+              return jsonResponse({ error: "invalid_grant", error_description: "redirect_uri mismatch" }, 400, getCorsHeaders(request));
+          }
+
+          // PKCE verification
+          if (codeData.codeChallenge) {
+              if (!codeVerifier) {
+                  return jsonResponse({ error: "invalid_grant", error_description: "code_verifier required" }, 400, getCorsHeaders(request));
+              }
+              const expectedChallenge = await generateCodeChallenge(codeVerifier);
+              if (expectedChallenge !== codeData.codeChallenge) {
+                  return jsonResponse({ error: "invalid_grant", error_description: "code_verifier mismatch" }, 400, getCorsHeaders(request));
+              }
+          }
+
+          // Codes are single-use
+          await env.MEMBERS_KV.delete(`self_oauth_code:${code}`);
+
+          const user = await getUser(env, codeData.userId);
+          if (!user) {
+              return jsonResponse({ error: "invalid_grant", error_description: "User not found" }, 400, getCorsHeaders(request));
+          }
+
+          const { apiKey, expires } = await createTempLoginKey(env, user);
+          const { sessionToken, _ } = await createSession(env, user.id);
+
+          // Set refreshed session cookie
+          const cookieExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toUTCString();
+          const cookieHeader = sessionToken 
+                ? `g4f_session=${sessionToken}; Path=/; Expires=${cookieExpiry}; SameSite=None; Secure; HttpOnly`
+                : null;
+
+          const headers = {
+             "Content-Type": "application/json",
+             ...getCorsHeaders(request)
+          };
+          if (cookieHeader) {
+             headers["Set-Cookie"] = cookieHeader;
+          }
+          return jsonResponse({
+              access_token: apiKey,
+              token_type: "bearer",
+              expires_in: expires - Math.floor(Date.now() / 1000),
+              scope: "profile",
+              user: getSafeUser(user)
+          }, 200, headers);
+      }
+
+      // ── client_credentials grant ───────────────────────────────────────────
+      if (grantType === "client_credentials") {
+          // Issue a temp key for the g4f user linked to this client, if configured
+          if (!client.user_id) {
+              return jsonResponse({ error: "unauthorized_client", error_description: "No user linked to this client" }, 400, getCorsHeaders(request));
+          }
+
+          const user = await getUser(env, client.user_id);
+          if (!user) {
+              return jsonResponse({ error: "invalid_client", error_description: "Linked user not found" }, 400, getCorsHeaders(request));
+          }
+
+          const { apiKey, expires } = await createTempLoginKey(env, user);
+
+          return jsonResponse({
+              access_token: apiKey,
+              token_type: "bearer",
+              expires_in: expires - Math.floor(Date.now() / 1000),
+              scope: "profile"
+          }, 200, getCorsHeaders(request));
+      }
+
+      return jsonResponse({ error: "unsupported_grant_type" }, 400, getCorsHeaders(request));
+  }
+
+  /**
+   * Create a Temporary Login Key (an API key with is_temporary: true) for a
+   * user and persist it in KV + the user record.  Used by the self-hosted
+   * OAuth token endpoint as the access_token issued to clients.
+   *
+   * @returns {Promise<{apiKey: string, expires: number}>} the raw API key
+   *   string (to return as access_token) and the expiry as a unix timestamp.
+   */
+  async function createTempLoginKey(env, user) {
+      const apiKey = await generateApiKey(env, user.id);
+      const keyHash = await hashApiKey(apiKey);
+      const keyPrefix = apiKey.substring(0, 8);
+      const expirationTtl = 7 * 24 * 60 * 60;
+      const expires = Date.now() + expirationTtl * 1000;
+
+      const keyData = {
+          id: generateKeyId(),
+          name: "Temporary Login Key",
+          key_hash: keyHash,
+          prefix: keyPrefix,
+          user_id: user.id,
+          created_at: new Date().toISOString(),
+          last_used: null,
+          is_temporary: true,
+          expires_at: new Date(expires).toISOString(),
+          usage: { requests: 0, tokens: 0 }
+      };
+
+      // Store API key mapping in KV for fast lookup (24h TTL)
+      await env.MEMBERS_KV.put(
+          `api_key:${keyHash}`,
+          JSON.stringify({
+              user_id: user.id,
+              key_id: keyData.id,
+              tier: user.tier,
+              is_temporary: true,
+              expires_at: keyData.expires_at,
+              expires: Math.floor(expires / 1000)
+          }),
+          { expirationTtl }
+      );
+
+      // Add to user's API keys
+      user.api_keys = user.api_keys || [];
+      user.api_keys.push(keyData);
+      user.updated_at = new Date().toISOString();
+      await saveUser(env, user);
+
+      return { apiKey, expires: Math.floor(expires / 1000) };
+  }
+
+  /**
+   * Resolve a bearer access_token to a user by treating it as a Temporary
+   * Login Key (API key).  Returns null if the key is missing, expired, or
+   * not marked temporary.
+   */
+  async function resolveTempLoginKey(env, token) {
+      if (!token || !token.startsWith("g4f_")) return null;
+
+      const keyHash = await hashApiKey(token);
+      const keyDataStr = await env.MEMBERS_KV.get(`api_key:${keyHash}`);
+      if (!keyDataStr) return null;
+
+      let keyInfo;
+      try {
+          keyInfo = JSON.parse(keyDataStr);
+      } catch {
+          return null;
+      }
+
+      // Only temporary login keys are valid as OAuth access tokens
+      if (!keyInfo.is_temporary) return null;
+
+      // Check expiry
+      if (keyInfo.expires_at && new Date(keyInfo.expires_at) <= new Date()) {
+          return null;
+      }
+
+      const user = await getUser(env, keyInfo.user_id);
+      if (!user) return null;
+
+      return { user, keyHash, keyId: keyInfo.key_id };
+  }
+
+  /**
+   * Look up a registered OAuth client from the SELF_OAUTH_CLIENTS env var.
+   *
+   * SELF_OAUTH_CLIENTS should be a JSON object:
+   * {
+   *   "<client_id>": {
+   *     "secret": "<client_secret>",
+   *     "redirect_uris": ["https://example.com/callback"],
+   *     "name": "My App",
+   *     "user_id": "<optional g4f user id for client_credentials>",
+   *     "provider": "<optional: single provider to show on the login-chooser page>"
+   *   }
+   * }
+   */
+  /**
+   * Built-in first-party OAuth clients. These are always available, even
+   * when SELF_OAUTH_CLIENTS is not configured. The secret is public by
+   * design - browser clients cannot hold secrets; PKCE protects the code.
+   */
+  const BUILTIN_OAUTH_CLIENTS = {
+      "g4f-web": {
+          secret: "5594a516-0da6-4167-bcaa-132e715c54a3",
+          redirect_uris: [],
+          name: "G4F Web"
+      },
+      "g4f-web-pollinations": {
+          secret: "5594a516-0da6-4167-bcaa-132e715c54a3",
+          redirect_uris: [],
+          name: "G4F Web",
+          provider: "pollinations"
+      },
+      "g4f-web-airforce": {
+          secret: "5594a516-0da6-4167-bcaa-132e715c54a3",
+          redirect_uris: [],
+          name: "G4F Web",
+          provider: "airforce"
+      },
+      "g4f-web-huggingface": {
+          secret: "5594a516-0da6-4167-bcaa-132e715c54a3",
+          redirect_uris: [],
+          name: "G4F Web",
+          provider: "huggingface"
+      }
+  };
+
+  async function getSelfOAuthClient(env, clientId) {
+      try {
+          if (BUILTIN_OAUTH_CLIENTS[clientId]) return BUILTIN_OAUTH_CLIENTS[clientId];
+          if (!env.SELF_OAUTH_CLIENTS) return null;
+          const clients = JSON.parse(env.SELF_OAUTH_CLIENTS);
+          return clients[clientId] || null;
+      } catch {
+          return null;
+      }
+  }
+
+  /**
+   * POST /members/oauth/revoke  (RFC 7009)
+   *
+   * Revokes an active access token (session token).  The client must
+   * authenticate itself with client_id + client_secret.  Revoking an
+   * already-expired or unknown token returns 200 per the RFC.
+   *
+   * Body (form-encoded or JSON):
+   *   token          — the access_token to revoke
+   *   token_type_hint — optional, "access_token" assumed
+   *   client_id
+   *   client_secret
+   */
+  async function handleSelfOAuthRevoke(request, env) {
+      if (request.method !== "POST") {
+          return jsonResponse({ error: "method_not_allowed" }, 405, getCorsHeaders(request));
+      }
+
+      let params = {};
+      const contentType = request.headers.get("Content-Type") || "";
+      try {
+          if (contentType.includes("application/json")) {
+              params = await request.json();
+          } else {
+              const form = await request.formData();
+              for (const [k, v] of form.entries()) params[k] = v;
+          }
+      } catch {
+          return jsonResponse({ error: "invalid_request", error_description: "Could not parse request body" }, 400, getCorsHeaders(request));
+      }
+
+      const clientId = params.client_id;
+      const clientSecret = params.client_secret;
+
+      if (!clientId || !clientSecret) {
+          return jsonResponse({ error: "invalid_client", error_description: "client_id and client_secret are required" }, 401, getCorsHeaders(request));
+      }
+
+      const client = await getSelfOAuthClient(env, clientId);
+      if (!client || client.secret !== clientSecret) {
+          return jsonResponse({ error: "invalid_client", error_description: "Invalid client credentials" }, 401, getCorsHeaders(request));
+      }
+
+      const token = params.token;
+      if (token) {
+          // Resolve as a temp login key and revoke it — per RFC 7009 §2.2 always return 200
+          const resolved = await resolveTempLoginKey(env, token);
+          if (resolved) {
+              await env.MEMBERS_KV.delete(`api_key:${resolved.keyHash}`);
+              // Remove from user's api_keys list
+              const user = resolved.user;
+              const keyIndex = (user.api_keys || []).findIndex(k => k.id === resolved.keyId);
+              if (keyIndex !== -1) {
+                  user.api_keys.splice(keyIndex, 1);
+                  user.updated_at = new Date().toISOString();
+                  await saveUser(env, user);
+              }
+          }
+      }
+
+      return new Response(null, { status: 200, headers: getCorsHeaders(request) });
+  }
+
+  /**
+   * GET /members/oauth/userinfo  (OpenID Connect §5.3 / OAuth 2.0)
+   *
+   * Returns claims about the authenticated user.  Accepts the access token
+   * either as a Bearer token in the Authorization header or as a query/body
+   * parameter named `access_token`.
+   *
+   * Response fields follow the OIDC standard claims naming:
+   *   sub, name, email, picture, preferred_username, profile
+   */
+  async function handleSelfOAuthUserInfo(request, env) {
+      // Extract token from Authorization header or query param
+      let token = request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
+      if (!token) {
+          const reqUrl = new URL(request.url);
+          token = reqUrl.searchParams.get("access_token") || null;
+      }
+      if (!token && request.method === "POST") {
+          try {
+              const ct = request.headers.get("Content-Type") || "";
+              if (ct.includes("application/json")) {
+                  const body = await request.json();
+                  token = body.access_token || null;
+              } else {
+                  const form = await request.formData();
+                  token = form.get("access_token") || null;
+              }
+          } catch { /* ignore */ }
+      }
+
+      if (!token) {
+          return jsonResponse({ error: "invalid_token", error_description: "Missing access token" }, 401, getCorsHeaders(request));
+      }
+
+      // Validate as a temporary login key (issued by the OAuth token endpoint)
+      const resolved = await resolveTempLoginKey(env, token);
+      if (!resolved) {
+          return jsonResponse({ error: "invalid_token", error_description: "Token not found, expired, or not a valid OAuth token" }, 401, getCorsHeaders(request));
+      }
+
+      const user = resolved.user;
+
+      return jsonResponse({
+          sub: user.id,
+          name: user.name || user.username,
+          preferred_username: user.username,
+          email: user.email || null,
+          picture: user.avatar || null,
+          profile: `https://g4f.dev/members.html`,
+          provider: user.provider,
+          tier: user.tier
+      }, 200, getCorsHeaders(request));
+  }
+
+  /** Escape HTML special chars for safe insertion into templates */
+  function escapeHtml(str) {
+      return String(str)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+  }
+
+  // ============================================
+  // User Management
+  // ============================================
+  
+  async function createOrUpdateUser(env, userData) {
+    const lookupKey = `user_lookup:${userData.provider}:${userData.username}`;
+    let userId = await env.MEMBERS_KV.get(lookupKey);
+    
+    const now = new Date().toISOString();
+    let user;
+
+    if (userId) {
+        // Update existing user
+        user = await getUser(env, userId);
+        if (user) {
+            user = { ...user, ...userData }
+            user.updated_at = now;
+            user.last_login = now;
+            // Tier is updated by scheduled handler, not on login
+        }
+    }
+  
+    if (!user) {
+        // Create new user
+        userId = generateUserId();
+        user = {
+            id: userId,
+            ...userData,
+            tier: "new",  // Tier is updated by scheduled handler
+            secret: generateUserSecret(),  // Per-user secret for cross-device workspace sharing
+            api_keys: [],
+            created_at: now,
+            updated_at: now,
+            last_login: now,
+            usage: {
+                requests_today: 0,
+                tokens_today: 0,
+                total_requests: 0,
+                total_tokens: 0,
+                last_reset: now
+            }
+        };
+    } else if (!user.secret) {
+        // Backfill secret for existing users who don't have one yet
+        user.secret = generateUserSecret();
+        user.updated_at = now;
+        await saveUser(env, user);
+        await env.MEMBERS_KV.put(`user:${user.id}`, JSON.stringify(user), { expirationTtl: 3600 });
+    }
+  
+    // Store lookup index for this user
+    await env.MEMBERS_KV.put(lookupKey, userId);
+  
+    // Save user to R2
+    await saveUser(env, user);
+  
+    // Cache user in KV for fast access
+    await env.MEMBERS_KV.put(`user:${userId}`, JSON.stringify(user), { expirationTtl: 3600 });
+  
+    return user;
+  }
+  
+  async function getUser(env, userId) {
+    // Try KV cache first
+    const cached = await env.MEMBERS_KV.get(`user:${userId}`);
+    if (cached) {
+        return JSON.parse(cached);
+    }
+  
+    // Fall back to R2
+    const object = await env.MEMBERS_BUCKET.get(`users/${userId}.json`);
+    if (!object) {
+        return null;
+    }
+  
+    const user = await object.json();
+    
+    // Cache for next time
+    await env.MEMBERS_KV.put(`user:${userId}`, JSON.stringify(user), { expirationTtl: 3600 });
+    
+    return user;
+  }
+  
+  async function saveUser(env, user) {
+    await env.MEMBERS_BUCKET.put(
+        `users/${user.id}.json`,
+        JSON.stringify(user, null, 2),
+        {
+            httpMetadata: {
+                contentType: "application/json"
+            }
+        }
+    );
+  
+    // Update cache
+    await env.MEMBERS_KV.put(`user:${user.id}`, JSON.stringify(user), { expirationTtl: 3600 });
+  }
+
+  // Public recent-users feed — returns the most recently created users.
+  // No authentication required. Only public fields are exposed:
+  //   username, provider, tier, created_at, avatar
+  // Used by the g4f Discord bot's live feed to announce new members.
+  async function handleGetRecentUsers(request, env) {
+    const url = new URL(request.url);
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "20", 10) || 20, 100);
+
+    if (!env.MEMBERS_BUCKET) {
+      return jsonResponse({ users: [] }, 200, getCorsHeaders(request));
+    }
+
+    // Iterate through all user objects in R2, collecting created_at timestamps.
+    // R2 list() returns objects sorted by key, not by mtime, so we must
+    // fetch each object's JSON to read created_at. To keep this cheap we
+    // cap the scan at a reasonable number of recent objects.
+    const users = [];
+    let listResult = await env.MEMBERS_BUCKET.list({ prefix: "users/", limit: 200 });
+    while (listResult && Array.isArray(listResult.objects) && users.length < limit * 4) {
+      // Process newest keys first (R2 lists in lexicographic order; user ids
+      // are random so order is arbitrary — we sort by created_at below).
+      for (const object of listResult.objects) {
+        if (!object.key.endsWith('.json')) continue;
+        try {
+          const userObject = await env.MEMBERS_BUCKET.get(object.key);
+          if (!userObject) continue;
+          const user = await userObject.json();
+          users.push({
+            id: user.id,
+            username: user.username,
+            provider: user.provider,
+            tier: user.tier,
+            created_at: user.created_at,
+            avatar: user.avatar || null
+          });
+        } catch (e) {
+          // skip malformed entries
+        }
+        if (users.length >= limit * 4) break;
+      }
+      if (listResult.truncated && users.length < limit * 4) {
+        listResult = await env.MEMBERS_BUCKET.list({
+          prefix: "users/",
+          limit: 200,
+          cursor: listResult.cursor
+        });
+      } else {
+        break;
+      }
+    }
+
+    // Sort by created_at descending and return the top *limit*.
+    users.sort((a, b) => {
+      const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return tb - ta;
+    });
+
+    return jsonResponse({
+      users: users.slice(0, limit)
+    }, 200, { "Cache-Control": "public, max-age=60", ...getCorsHeaders(request) });
+  }
+
+  async function handleGetUser(request, env) {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+        return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+    }
+  
+    // Remove sensitive data before returning
+    const safeUser = getSafeUser(user);
+  
+    return jsonResponse({ user: safeUser }, 200, getCorsHeaders(request));
+  }
+  
+  async function handleUpdateUser(request, env) {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+        return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+    }
+  
+    if (request.method !== "POST") {
+        return jsonResponse({ error: "Method not allowed" }, 405, getCorsHeaders(request));
+    }
+  
+    const body = await request.json();
+    const allowedFields = ["name", "email"];
+    
+    for (const field of allowedFields) {
+        if (body[field] !== undefined) {
+            user[field] = body[field];
+        }
+    }
+  
+    user.updated_at = new Date().toISOString();
+    await saveUser(env, user);
+  
+    const safeUser = getSafeUser(user);
+  
+    return jsonResponse({ user: safeUser, message: "User updated successfully" }, 200, getCorsHeaders(request));
+  }
+  
+  async function handleDeleteUser(request, env) {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+        return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+    }
+  
+    if (request.method !== "POST" && request.method !== "DELETE") {
+        return jsonResponse({ error: "Method not allowed" }, 405, getCorsHeaders(request));
+    }
+  
+    // Parse body to check for immediate flag (admin override) or confirm flag
+    let body = {};
+    try {
+        body = await request.json();
+    } catch {
+        // No body or invalid JSON — default to scheduled deletion
+    }
+  
+    // Schedule deletion with a 24-hour grace period so the user can cancel
+    const now = new Date();
+    const deletionAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    user.scheduled_deletion = deletionAt.toISOString();
+    user.updated_at = now.toISOString();
+    await saveUser(env, user);
+  
+    return jsonResponse({
+        message: "Account deletion scheduled. You have 24 hours to cancel.",
+        scheduled_deletion: user.scheduled_deletion,
+        can_cancel_until: user.scheduled_deletion
+    }, 200, getCorsHeaders(request));
+  }
+  
+  /**
+   * POST /members/api/user/delete/cancel
+   * Cancel a previously scheduled account deletion.
+   */
+  async function handleCancelDeleteUser(request, env) {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+        return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+    }
+  
+    if (request.method !== "POST") {
+        return jsonResponse({ error: "Method not allowed" }, 405, getCorsHeaders(request));
+    }
+  
+    if (!user.scheduled_deletion) {
+        return jsonResponse({ error: "No scheduled deletion to cancel" }, 400, getCorsHeaders(request));
+    }
+  
+    delete user.scheduled_deletion;
+    user.updated_at = new Date().toISOString();
+    await saveUser(env, user);
+  
+    return jsonResponse({ message: "Account deletion cancelled" }, 200, getCorsHeaders(request));
+  }
+  
+  /**
+   * Actually perform the deletion of a user. Called by the scheduled handler
+   * once the grace period has elapsed, or by handleDeleteUser for immediate
+   * admin overrides.
+   */
+  async function performUserDeletion(env, user) {
+    // Delete user data
+    await env.MEMBERS_BUCKET.delete(`users/${user.id}.json`);
+    await env.MEMBERS_KV.delete(`user:${user.id}`);
+    await env.MEMBERS_KV.delete(`user_lookup:${user.provider}:${user.username}`);
+  
+    // Delete lookups for any linked providers
+    const linkedProviders = ["github", "discord", "huggingface", "airforce", "pollinations"];
+    for (const provider of linkedProviders) {
+        if (user[provider] && user[provider].username) {
+            await env.MEMBERS_KV.delete(`user_lookup:${provider}:${user[provider].username}`);
+        }
+    }
+  
+    // Delete all API keys
+    for (const keyData of user.api_keys || []) {
+        await env.MEMBERS_KV.delete(`api_key:${keyData.key_hash}`);
+    }
+
+    // Delete all sessions for this user (tracked via user_sessions index)
+    const sessionsKey = `user_sessions:${user.id}`;
+    const sessionsList = await env.MEMBERS_KV.get(sessionsKey);
+    if (sessionsList) {
+        const sessionTokens = JSON.parse(sessionsList);
+        for (const token of sessionTokens) {
+            await env.MEMBERS_KV.delete(`session:${token}`);
+        }
+    }
+    await env.MEMBERS_KV.delete(sessionsKey);
+  }
+  
+  /**
+   * POST /members/api/user/unlink
+   * Remove the link to a secondary provider while keeping the main provider.
+   * Body: { "provider": "<github|discord|huggingface|airforce|pollinations>" }
+   */
+  async function handleUnlinkProvider(request, env) {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+        return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+    }
+  
+    if (request.method !== "POST") {
+        return jsonResponse({ error: "Method not allowed" }, 405, getCorsHeaders(request));
+    }
+  
+    let body;
+    try {
+        body = await request.json();
+    } catch {
+        return jsonResponse({ error: "Invalid JSON body" }, 400, getCorsHeaders(request));
+    }
+  
+    const provider = body.provider;
+    if (!provider) {
+        return jsonResponse({ error: "Missing required field: provider" }, 400, getCorsHeaders(request));
+    }
+  
+    // The main provider cannot be unlinked
+    if (provider === user.provider) {
+        return jsonResponse({ error: "Cannot unlink the main provider. Set a different main provider first." }, 400, getCorsHeaders(request));
+    }
+  
+    if (!user[provider]) {
+        return jsonResponse({ error: `Provider ${provider} is not linked to your account` }, 400, getCorsHeaders(request));
+    }
+  
+    // Remove the provider link and its lookup index
+    const linkedData = user[provider];
+    if (linkedData && linkedData.username) {
+        await env.MEMBERS_KV.delete(`user_lookup:${provider}:${linkedData.username}`);
+    }
+    delete user[provider];
+    user.updated_at = new Date().toISOString();
+    await saveUser(env, user);
+  
+    const safeUser = getSafeUser(user);
+    return jsonResponse({ user: safeUser, message: `Provider ${provider} unlinked successfully` }, 200, getCorsHeaders(request));
+  }
+
+  /**
+   * Handle POST /members/api/anonymous/upgrade
+   * Upgrade anonymous tier based on username (calculates hash) or direct hash value
+   * Body: { "username": "user_name" } OR { "hash": "hash_value" }
+   */
+  async function handleAnonymousTierUpgrade(pathname, request, env) {
+    let hashValue;
+    let username;
+    if (request.method === "POST") {
+        let body;
+        try {
+            body = await request.json();
+        } catch (e) {
+            return jsonResponse({ error: "Invalid JSON body" }, 400, getCorsHeaders(request));
+        }
+        
+        hashValue = body.hash;
+
+        // If username provided, calculate hash from it
+        if (body.username && !hashValue) {
+            hashValue = await calculateHashFromUsername(body.username);
+        }
+        
+        if (!hashValue) {
+            return jsonResponse({ error: "Missing required field: username or hash" }, 400, getCorsHeaders(request));
+        }
+    } else {
+        username = pathname.split("/").pop();
+        hashValue = await calculateHashFromUsername(username);
+    }
+    
+    // Return tier information and limits
+    const upgradedTier = 'anonymous';
+    const tierLimits = USER_TIER_LIMITS[upgradedTier];
+    const tierInfo = {
+        hash: hashValue,
+        tier: upgradedTier,
+        limits: tierLimits,
+    };
+    
+    return jsonResponse(tierInfo, 200, getCorsHeaders(request));
+  }
+  
+  // ============================================
+  // API Key Management
+  // ============================================
+  
+  async function handleListApiKeys(request, env) {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+        return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+    }
+  
+    // Return API keys without the actual key values (only metadata)
+    const keys = (user.api_keys || []).map(k => ({
+        id: k.id,
+        name: k.name,
+        prefix: k.prefix,
+        created_at: k.created_at,
+        last_used: k.last_used,
+        expires_at: k.expires_at,
+        usage: k.usage
+    }));
+  
+    return jsonResponse({ api_keys: keys }, 200, getCorsHeaders(request));
+  }
+  
+  async function handleGenerateApiKey(request, env, ctx) {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+        return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+    }
+  
+    if (request.method !== "POST") {
+        return jsonResponse({ error: "Method not allowed" }, 405, getCorsHeaders(request));
+    }
+  
+    const tierLimits = USER_TIERS[user.tier] || USER_TIERS.new;
+    let revokedKey = null;
+  
+    // Automatically revoke oldest API key if at limit
+    if ((user.api_keys || []).length >= tierLimits.api_keys) {
+        // Sort by created_at and revoke the oldest key
+        const sortedKeys = [...(user.api_keys || [])].sort(
+            (a, b) => new Date(a.created_at) - new Date(b.created_at)
+        );
+        const oldestKey = sortedKeys[0];
+  
+        if (oldestKey) {
+            // Remove from KV lookup
+            await env.MEMBERS_KV.delete(`api_key:${oldestKey.key_hash}`);
+  
+            // Remove from user's keys
+            const keyIndex = user.api_keys.findIndex(k => k.id === oldestKey.id);
+            if (keyIndex !== -1) {
+                user.api_keys.splice(keyIndex, 1);
+            }
+  
+            // Archive in R2 for audit trail
+            await env.MEMBERS_BUCKET.put(
+                `api_keys/${user.id}/${oldestKey.id}_revoked.json`,
+                JSON.stringify({
+                    ...oldestKey,
+                    revoked_at: new Date().toISOString(),
+                    revoked_reason: "auto_revoked_on_new_key_generation"
+                }, null, 2),
+                {
+                    httpMetadata: { contentType: "application/json" }
+                }
+            );
+  
+            revokedKey = {
+                id: oldestKey.id,
+                name: oldestKey.name,
+                prefix: oldestKey.prefix
+            };
+        }
+    }
+  
+    const body = await request.json().catch(() => ({}));
+    const keyName = body.name || `API Key ${(user.api_keys || []).length + 1}`;
+  
+    // Generate unique API key
+    const apiKey = await generateApiKey(env, user.id);
+    const keyHash = await hashApiKey(apiKey);
+    const keyPrefix = apiKey.substring(0, 8);
+    const expirationTtl = (body.expires_days || 90) * 24 * 60 * 60;
+    const expires = Date.now() + expirationTtl * 1000;
+  
+    const keyData = {
+        id: generateKeyId(),
+        name: keyName,
+        key_hash: keyHash,
+        prefix: keyPrefix,
+        user_id: user.id,
+        created_at: new Date().toISOString(),
+        expires_at: new Date(expires).toISOString(),
+        last_used: null,
+        usage: {
+            requests: 0,
+            tokens: 0
+        }
+    };
+  
+    // Store API key mapping in KV for fast lookup
+    await env.MEMBERS_KV.put(`api_key:${keyHash}`, JSON.stringify({
+        user_id: user.id,
+        key_id: keyData.id,
+        tier: user.tier,
+        username: user.username,
+        expires_at: keyData.expires_at,
+        expires: Math.floor(expires / 1000)
+    }), { expirationTtl: expirationTtl });
+  
+    // Add to user's API keys
+    user.api_keys = user.api_keys || [];
+    user.api_keys.push(keyData);
+    user.updated_at = new Date().toISOString();
+    await saveUser(env, user);
+  
+    // Store API key in R2 for auditing
+    await env.MEMBERS_BUCKET.put(
+        `api_keys/${user.id}/${keyData.id}.json`,
+        JSON.stringify({
+            ...keyData,
+            user_id: user.id,
+            user_email: user.email
+        }, null, 2),
+        {
+            httpMetadata: { contentType: "application/json" }
+        }
+    );
+  
+    const response = {
+        message: "API key generated successfully",
+        api_key: apiKey,
+        key_data: {
+            id: keyData.id,
+            name: keyData.name,
+            prefix: keyPrefix,
+            created_at: keyData.created_at,
+            expires_at: keyData.expires_at
+        },
+        expires: Math.floor(expires / 1000),
+        warning: "Save this API key now. You won't be able to see it again!"
+    };
+  
+    if (revokedKey) {
+        response.revoked_key = revokedKey;
+        response.message = "API key generated successfully. Old key was automatically revoked.";
+    }
+  
+    return jsonResponse(response, 200, getCorsHeaders(request));
+  }
+  
+  async function handleRevokeApiKey(request, env) {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+        return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+    }
+  
+    if (request.method !== "POST" && request.method !== "DELETE") {
+        return jsonResponse({ error: "Method not allowed" }, 405, getCorsHeaders(request));
+    }
+  
+    const body = await request.json();
+    const keyId = body.key_id;
+  
+    if (!keyId) {
+        return jsonResponse({ error: "key_id is required" }, 400, getCorsHeaders(request));
+    }
+  
+    const keyIndex = (user.api_keys || []).findIndex(k => k.id === keyId);
+    if (keyIndex === -1) {
+        return jsonResponse({ error: "API key not found" }, 404, getCorsHeaders(request));
+    }
+  
+    const keyData = user.api_keys[keyIndex];
+  
+    // Remove from KV lookup
+    await env.MEMBERS_KV.delete(`api_key:${keyData.key_hash}`);
+  
+    // Remove from user's keys
+    user.api_keys.splice(keyIndex, 1);
+    user.updated_at = new Date().toISOString();
+    await saveUser(env, user);
+  
+    // Archive in R2 (don't delete for audit trail)
+    await env.MEMBERS_BUCKET.put(
+      `api_keys/${user.id}/${keyData.id}_revoked.json`,
+      JSON.stringify({
+        ...keyData,
+        revoked_at: new Date().toISOString()
+      }, null, 2),
+      { httpMetadata: { contentType: "application/json" } }
+    );
+  
+    return jsonResponse({ message: "API key revoked successfully" }, 200, getCorsHeaders(request));
+  }
+
+  /**
+   * Handle GET/POST /members/api/keys/revoke-by-key
+   * GET: Returns an HTML form to input the API key string
+   * POST: Accepts the API key string, hashes it, looks up the owner, and revokes it
+   */
+  async function handleRevokeApiKeyByKey(request, env) {
+    if (request.method === "GET") {
+      return new Response(REVOKE_BY_KEY_HTML, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          ...getCorsHeaders(request)
+        }
+      });
+    }
+
+    if (request.method !== "POST") {
+      return jsonResponse({ error: "Method not allowed" }, 405, getCorsHeaders(request));
+    }
+
+    let apiKey;
+    const contentType = request.headers.get("Content-Type") || "";
+
+    if (contentType.includes("application/json")) {
+      const body = await request.json();
+      apiKey = body.api_key;
+    } else {
+      // Parse form-encoded body
+      const formData = await request.formData();
+      apiKey = formData.get("api_key");
+    }
+
+    if (!apiKey || typeof apiKey !== "string" || !apiKey.trim()) {
+      return new Response(REVOKE_BY_KEY_RESULT_HTML("error", "No API key provided"), {
+        status: 400,
+        headers: { "Content-Type": "text/html; charset=utf-8", ...getCorsHeaders(request) }
+      });
+    }
+
+    apiKey = apiKey.trim();
+    const keyHash = await hashApiKey(apiKey);
+    const keyDataStr = await env.MEMBERS_KV.get(`api_key:${keyHash}`);
+
+    if (!keyDataStr) {
+      return new Response(REVOKE_BY_KEY_RESULT_HTML("error", "Invalid API key — not found in system"), {
+        status: 404,
+        headers: { "Content-Type": "text/html; charset=utf-8", ...getCorsHeaders(request) }
+      });
+    }
+
+    const { user_id, key_id } = JSON.parse(keyDataStr);
+    const user = await getUser(env, user_id);
+
+    if (!user) {
+      return new Response(REVOKE_BY_KEY_RESULT_HTML("error", "User associated with this key no longer exists"), {
+        status: 404,
+        headers: { "Content-Type": "text/html; charset=utf-8", ...getCorsHeaders(request) }
+      });
+    }
+
+    // Find the key in user's api_keys
+    const keyIndex = (user.api_keys || []).findIndex(k => k.id === key_id);
+    if (keyIndex === -1) {
+      // Key mapping exists but not in user's list — clean up the orphaned mapping
+      await env.MEMBERS_KV.delete(`api_key:${keyHash}`);
+      return new Response(REVOKE_BY_KEY_RESULT_HTML("error", "API key mapping was orphaned — cleaned up"), {
+        status: 404,
+        headers: { "Content-Type": "text/html; charset=utf-8", ...getCorsHeaders(request) }
+      });
+    }
+
+    const keyData = user.api_keys[keyIndex];
+
+    // Remove from KV lookup
+    await env.MEMBERS_KV.delete(`api_key:${keyHash}`);
+
+    // Remove from user's keys
+    user.api_keys.splice(keyIndex, 1);
+    user.updated_at = new Date().toISOString();
+    await saveUser(env, user);
+
+    // Archive in R2 for audit trail
+    await env.MEMBERS_BUCKET.put(
+      `api_keys/${user.id}/${keyData.id}_revoked.json`,
+      JSON.stringify({
+        ...keyData,
+        revoked_at: new Date().toISOString(),
+        revoked_reason: "revoked_by_key_value"
+      }, null, 2),
+      { httpMetadata: { contentType: "application/json" } }
+    );
+
+    return new Response(
+      REVOKE_BY_KEY_RESULT_HTML("success", `API key "${keyData.name}" (prefix: ${keyData.prefix}…) revoked successfully for user ${user.username}`),
+      {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8", ...getCorsHeaders(request) }
+      }
+    );
+  }
+
+  async function handleValidateApiKey(request, env) {
+    const apiKey = request.headers.get("X-API-Key") || 
+                   request.headers.get("Authorization")?.replace("Bearer ", "");
+  
+    if (!apiKey) {
+        return jsonResponse({ valid: false, error: "No API key provided" }, 401, getCorsHeaders(request));
+    }
+  
+    const keyHash = await hashApiKey(apiKey);
+    const keyData = await env.MEMBERS_KV.get(`api_key:${keyHash}`);
+  
+    if (!keyData) {
+        return jsonResponse({ valid: false, error: "Invalid API key" }, 401, getCorsHeaders(request));
+    }
+  
+    const { user_id, key_id, expires } = JSON.parse(keyData);
+    const user = await getUser(env, user_id);
+  
+    if (!user) {
+        return jsonResponse({ valid: false, error: "User not found" }, 401, getCorsHeaders(request));
+    }
+  
+    // Update last_used timestamp
+    const keyIndex = user.api_keys.findIndex(k => k.id === key_id);
+    if (keyIndex !== -1) {
+        user.api_keys[keyIndex].last_used = new Date().toISOString();
+        await saveUser(env, user);
+    }
+  
+    return jsonResponse({
+        valid: true,
+        user_id: user.id,
+        tier: user.tier,
+        username: user.username,
+        limits: USER_TIERS[user.tier] || USER_TIERS.new,
+        expires
+    }, 200, getCorsHeaders(request));
+  }
+  
+  // ============================================
+  // Usage Tracking
+  // ============================================
+  
+  async function handleGetUsage(request, env) {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+        return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+    }
+  
+    // Initialize usage if not present
+    if (!user.usage) {
+        user.usage = {
+            requests_today: 0,
+            tokens_today: 0,
+            total_requests: 0,
+            total_tokens: 0,
+            last_reset: new Date().toISOString()
+        };
+    }
+  
+    const now = Date.now();
+    let requestsToday = 0;
+    let tokensToday = 0;
+  
+    // Get actual usage from rate limit counters in KV
+    if (env.MEMBERS_KV) {
+        const dayKey = `rate_limit:${user.id}:day`;
+        const dayData = await env.MEMBERS_KV.get(dayKey);
+        if (dayData) {
+            const data = JSON.parse(dayData);
+            // Check if it's still within the day window
+            if (now - data.timestamp < RATE_LIMITS.windows.day) {
+                requestsToday = data.requests || 0;
+                tokensToday = data.tokens || 0;
+            }
+        }
+    }
+  
+    const tierLimits = USER_TIERS[user.tier] || USER_TIERS.new;
+  
+    return jsonResponse({
+        usage: {
+            requests_today: requestsToday,
+            tokens_today: tokensToday,
+            total_requests: user.usage.total_requests || 0,
+            total_tokens: user.usage.total_tokens || 0
+        },
+        limits: {
+            requests_per_day: tierLimits.requests_per_day,
+            tokens_per_day: tierLimits.tokens_per_day
+        },
+        remaining: {
+            requests: Math.max(0, tierLimits.requests_per_day - requestsToday),
+            tokens: Math.max(0, tierLimits.tokens_per_day - tokensToday)
+        }
+    }, 200, getCorsHeaders(request));
+  }
+  
+  async function handleGetUsageHistory(request, env) {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+        return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+    }
+  
+    const url = new URL(request.url);
+    const days = parseInt(url.searchParams.get("days") || "7");
+    
+    const history = [];
+    const now = new Date();
+  
+    for (let i = 0; i < days; i++) {
+        const date = new Date(now);
+        date.setUTCDate(date.getUTCDate() - i);
+        const dateKey = date.toISOString().split("T")[0];
+  
+        // Try to get usage for this day from R2
+        const usageData = await env.MEMBERS_BUCKET.get(`usage/${user.id}/${dateKey}.json`);
+        if (usageData) {
+            history.push(await usageData.json());
+        } else {
+            history.push({
+                date: dateKey,
+                requests: 0,
+                tokens: 0
+            });
+        }
+    }
+  
+    return jsonResponse({ history }, 200, getCorsHeaders(request));
+  }
+  
+  async function handleTrackUsage(request, env, ctx) {
+    if (request.method !== "POST") {
+        return jsonResponse({ error: "Method not allowed" }, 405, getCorsHeaders(request));
+    }
+  
+    const apiKey = request.headers.get("X-API-Key") ||
+                   request.headers.get("Authorization")?.replace("Bearer ", "");
+  
+    if (!apiKey) {
+        return jsonResponse({ error: "No API key provided" }, 401, getCorsHeaders(request));
+    }
+  
+    const keyHash = await hashApiKey(apiKey);
+    const keyDataStr = await env.MEMBERS_KV.get(`api_key:${keyHash}`);
+  
+    if (!keyDataStr) {
+        return jsonResponse({ error: "Invalid API key" }, 401, getCorsHeaders(request));
+    }
+  
+    const { user_id, key_id } = JSON.parse(keyDataStr);
+    const user = await getUser(env, user_id);
+  
+    if (!user) {
+        return jsonResponse({ error: "User not found" }, 404, getCorsHeaders(request));
+    }
+  
+    const body = await request.json();
+    const { requests = 1, tokens = 0, provider = null, model = null, username = null } = body;
+  
+    // Update user usage
+    user.usage.requests_today += requests;
+    user.usage.tokens_today += tokens;
+    user.usage.total_requests += requests;
+    user.usage.total_tokens += tokens;
+  
+    // Update API key usage
+    const keyIndex = user.api_keys.findIndex(k => k.id === key_id);
+    if (keyIndex !== -1) {
+        user.api_keys[keyIndex].usage.requests += requests;
+        user.api_keys[keyIndex].usage.tokens += tokens;
+        user.api_keys[keyIndex].last_used = new Date().toISOString();
+    }
+  
+    await saveUser(env, user);
+  
+    // Store daily usage in R2 for history (async)
+    const dateKey = new Date().toISOString().split("T")[0];
+    ctx.waitUntil(updateDailyUsage(env, user.id, dateKey, requests, tokens, provider, model));
+  
+    return jsonResponse({ success: true }, 200, getCorsHeaders(request));
+  }
+  
+  async function updateDailyUsage(env, userId, dateKey, requests, tokens, provider, model) {
+    const usagePath = `usage/${userId}/${dateKey}.json`;
+    const existing = await env.MEMBERS_BUCKET.get(usagePath);
+    
+    let usageData;
+    if (existing) {
+        usageData = await existing.json();
+    } else {
+        usageData = {
+            date: dateKey,
+            requests: 0,
+            tokens: 0,
+            providers: {},
+            models: {}
+        };
+    }
+  
+    usageData.requests += requests;
+    usageData.tokens += tokens;
+  
+    if (provider) {
+        usageData.providers[provider] = (usageData.providers[provider] || 0) + requests;
+    }
+    if (model) {
+        usageData.models[model] = (usageData.models[model] || 0) + requests;
+    }
+  
+    await env.MEMBERS_BUCKET.put(usagePath, JSON.stringify(usageData, null, 2), {
+        httpMetadata: { contentType: "application/json" }
+    });
+  }
+  
+  // ============================================
+  // Session Management
+  // ============================================
+  
+  async function createSession(env, userId) {
+    const sessionToken = generateSessionToken();
+    const user = await getUser(env, userId);
+    const expires = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    const sessionData = {
+        user_id: userId,
+        created_at: new Date().toISOString(),
+        expires_at: new Date(expires).toISOString() // 7 days
+    };
+  
+    await env.MEMBERS_KV.put(
+        `session:${sessionToken}`,
+        JSON.stringify(sessionData),
+        { expirationTtl: 7 * 24 * 60 * 60 } // 7 days
+    );
+
+    // Track this session token under the user's session index so we can
+    // clean up all sessions on account deletion or provider disconnect.
+    const sessionsKey = `user_sessions:${userId}`;
+    const existing = await env.MEMBERS_KV.get(sessionsKey);
+    const sessions = existing ? JSON.parse(existing) : [];
+    sessions.push(sessionToken);
+    await env.MEMBERS_KV.put(
+        sessionsKey,
+        JSON.stringify(sessions),
+        { expirationTtl: 7 * 24 * 60 * 60 } // 7 days
+    );
+  
+    return {sessionToken, expires: Math.floor(expires/1000)}
+  }
+  
+  async function authenticateRequest(request, env, refreshSession = false) {
+    // Check for session token in Authorization header or cookie
+    let sessionToken = request.headers.get("Authorization")?.replace("Bearer ", "");
+    
+    if (!sessionToken) {
+        const cookie = request.headers.get("Cookie");
+        if (cookie) {
+            const match = cookie.match(/g4f_session=([^;]+)/);
+            sessionToken = match ? match[1] : null;
+        }
+    }
+  
+    if (sessionToken) {
+        const sessionData = await env.MEMBERS_KV.get(`session:${sessionToken}`);
+        if (sessionData) {
+            const session = JSON.parse(sessionData);
+            if (new Date(session.expires_at) > new Date()) {
+                const user = await getUser(env, session.user_id);
+                if (user && refreshSession) {
+                    // Refresh session expiry
+                    await refreshSessionExpiry(env, sessionToken);
+                }
+                return user;
+            }
+        }
+    }
+  
+    return null;
+  }
+  
+  async function refreshSessionExpiry(env, sessionToken) {
+    const sessionData = await env.MEMBERS_KV.get(`session:${sessionToken}`);
+    if (sessionData) {
+        const session = JSON.parse(sessionData);
+        session.expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        await env.MEMBERS_KV.put(
+            `session:${sessionToken}`,
+            JSON.stringify(session),
+            { expirationTtl: 7 * 24 * 60 * 60 } // 7 days
+        );
+    }
+  }
+  
+  async function handleLogout(request, env) {
+    let sessionToken = request.headers.get("Authorization")?.replace("Bearer ", "");
+    
+    if (!sessionToken) {
+        const cookie = request.headers.get("Cookie");
+        if (cookie) {
+            const match = cookie.match(/g4f_session=([^;]+)/);
+            sessionToken = match ? match[1] : null;
+        }
+    }
+    
+    if (sessionToken) {
+        await env.MEMBERS_KV.delete(`session:${sessionToken}`);
+    }
+  
+    // Clear the session cookie
+    const clearCookie = "g4f_session=; domain=g4f.space; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=None; Secure";
+  
+    return new Response(JSON.stringify({ message: "Logged out successfully" }), {
+        status: 200,
+        headers: {
+            "Content-Type": "application/json",
+            "Set-Cookie": clearCookie,
+            ...getCorsHeaders(request)
+        }
+    });
+  }
+  
+  async function handleCheckSession(request, env) {
+    const user = await authenticateRequest(request, env, true); // Refresh session on check
+    
+    if (!user) {
+        return jsonResponse({ authenticated: false }, 401, getCorsHeaders(request));
+    }
+  
+    const safeUser = getSafeUser(user);
+  
+    // Get session token to set refreshed cookie
+    let sessionToken = request.headers.get("Authorization")?.replace("Bearer ", "");
+    if (!sessionToken) {
+        const cookie = request.headers.get("Cookie");
+        if (cookie) {
+            const match = cookie.match(/g4f_session=([^;]+)/);
+            sessionToken = match ? match[1] : null;
+        }
+    }
+  
+    // Set refreshed session cookie
+    const expires = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    const cookieExpiry = new Date(expires).toUTCString();
+    const cookieHeader = sessionToken 
+        ? `g4f_session=${sessionToken}; domain=g4f.space; Path=/; Expires=${cookieExpiry}; SameSite=None; Secure`
+        : null;
+  
+    const headers = {
+        "Content-Type": "application/json",
+        ...getCorsHeaders(request)
+    };
+    if (cookieHeader) {
+        headers["Set-Cookie"] = cookieHeader;
+    }
+  
+    return new Response(JSON.stringify({ 
+        authenticated: true,
+        user: safeUser,
+        expires: Math.floor(expires / 1000)
+    }), {
+        status: 200,
+        headers
+    });
+  }
+  
+  // ============================================
+  // Utility Functions
+  // ============================================
+  
+  function generateState() {
+    const array = new Uint8Array(32);
+    crypto.getRandomValues(array);
+    return Array.from(array, byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  function toBase64Url(buffer) {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    let binary = "";
+    for (const byte of bytes) {
+        binary += String.fromCharCode(byte);
+    }
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function generateCodeVerifier() {
+    const bytes = new Uint8Array(64);
+    crypto.getRandomValues(bytes);
+    return toBase64Url(bytes);
+  }
+
+  async function generateCodeChallenge(codeVerifier) {
+    const data = new TextEncoder().encode(codeVerifier);
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    return toBase64Url(digest);
+  }
+  
+  function generateUserId() {
+    const timestamp = Date.now().toString(36);
+    const randomPart = crypto.getRandomValues(new Uint8Array(8));
+    const randomStr = Array.from(randomPart, byte => byte.toString(16).padStart(2, "0")).join("");
+    return `u_${timestamp}${randomStr}`;
+  }
+  
+  function generateKeyId() {
+    const array = new Uint8Array(8);
+    crypto.getRandomValues(array);
+    return `k_${Array.from(array, byte => byte.toString(16).padStart(2, "0")).join("")}`;
+  }
+  
+  function generateSessionToken() {
+    const array = new Uint8Array(32);
+    crypto.getRandomValues(array);
+    return "gfs_" + Array.from(array, byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  function generateUserSecret() {
+    const array = new Uint8Array(32);
+    crypto.getRandomValues(array);
+    return Array.from(array, byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+  
+  async function generateApiKey(env, userId) {
+    // Create a unique, user-specific API key
+    const timestamp = Date.now();
+    const randomPart = crypto.getRandomValues(new Uint8Array(24));
+    const randomStr = Array.from(randomPart, byte => byte.toString(16).padStart(2, "0")).join("");
+    
+    // Format: g4f_<user_prefix>_<random>_<checksum>
+    const userPrefix = userId.substring(0, 8);
+    const keyBase = `g4f_${userPrefix}_${randomStr}`;
+    
+    // Add checksum
+    const encoder = new TextEncoder();
+    const data = encoder.encode(keyBase + (env.API_KEY_SALT || "g4f-salt"));
+    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+    const hashArray = new Uint8Array(hashBuffer);
+    const checksum = Array.from(hashArray.slice(0, 4), byte => byte.toString(16).padStart(2, "0")).join("");
+    
+    return `${keyBase}_${checksum}`;
+  }
+  
+  async function hashApiKey(apiKey) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(apiKey);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+    const hashArray = new Uint8Array(hashBuffer);
+    return Array.from(hashArray, byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+  
+  function jsonResponse(data, status = 200, extraHeaders = {}) {
+    return new Response(JSON.stringify(data), {
+        status,
+        headers: {
+            "Content-Type": "application/json",
+            ...extraHeaders
+        }
+    });
+  }
+  
+  function redirectWithError(error) {
+    const redirectUrl = new URL(OAUTH_REDIRECT_URI);
+    redirectUrl.searchParams.set("error", error);
+    return Response.redirect(redirectUrl.toString(), 302);
+  }
+  
+  function redirectWithSession(request, sessionToken, user, expires) {
+    const redirectUrl = new URL(OAUTH_REDIRECT_URI);
+    redirectUrl.searchParams.set("session", sessionToken);
+    redirectUrl.searchParams.set("user", encodeURIComponent(JSON.stringify(getSafeUser(user))));
+    redirectUrl.searchParams.set("expires", String(expires));
+    // Set session cookie with 7 day expiry
+    const cookieExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toUTCString();
+    const cookie = `g4f_session=${sessionToken}; domain=g4f.space; Path=/; Expires=${cookieExpiry}; SameSite=None; Secure`;
+    
+    return new Response(null, {
+        status: 302,
+        headers: {
+            "Location": redirectUrl.toString(),
+            "Set-Cookie": cookie,
+            ...getCorsHeaders(request)
+        }
+    });
+  }
+  
+  /**
+   * Redirect to external URL with session token for cloud sync
+   * Used for login redirects from chat interface
+   */
+  function redirectWithSessionToExternal(request, sessionToken, user, externalRedirectUrl, conversation = null, expires = null) {
+      const redirectUrl = new URL(externalRedirectUrl);
+      if (redirectUrl.pathname === "/members/oauth/authorize/callback") {
+          redirectUrl.searchParams.set("session", sessionToken);
+      } else {
+          const hashParams = new URLSearchParams();
+          hashParams.set("session", sessionToken);
+          hashParams.set("user", encodeURIComponent(JSON.stringify(getSafeUser(user))));
+          if (conversation) {
+            hashParams.set("conversation", conversation);
+          }
+          if (expires) {
+            hashParams.set("expires", expires);
+          }
+          redirectUrl.hash = hashParams.toString();
+      }
+      
+      // Set session cookie with 7 day expiry
+      const cookieExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toUTCString();
+      const cookie = `g4f_session=${sessionToken}; domain=g4f.space; Path=/; Expires=${cookieExpiry}; SameSite=None; Secure`;
+      
+      return new Response(null, {
+          status: 302,
+          headers: {
+              "Location": redirectUrl.toString(),
+              "Set-Cookie": cookie,
+              ...getCorsHeaders(request)
+          }
+      });
+  }
+  
+  // ============================================
+  // Extended Rate Limiting Functions
+  // ============================================
+  
+  /**
+   * Get rate limits configuration for a user tier
+   */
+  function getRateLimitsForTier(tier) {
+      const tierLimits = USER_TIER_LIMITS[tier] || USER_TIER_LIMITS.new;
+      return {
+          tokens: tierLimits.tokens,
+          requests: tierLimits.requests,
+          burstMultiplier: tierLimits.burstMultiplier || 1.5,
+          windows: RATE_LIMITS.windows
+      };
+  }
+  
+  /**
+   * Get rate limit usage for an authenticated user across all windows
+   */
+  async function getUserRateLimitUsage(env, userId) {
+      if (!env.MEMBERS_KV) {
+          return {
+              minute: { tokens: 0, requests: 0, timestamp: Date.now() },
+              hour: { tokens: 0, requests: 0, timestamp: Date.now() },
+              day: { tokens: 0, requests: 0, timestamp: Date.now() }
+          };
+      }
+  
+      const now = Date.now();
+      const keys = ['minute', 'hour', 'day'];
+      const results = {};
+  
+      const promises = keys.map(async (window) => {
+          const key = `user_rate:${userId}:${window}`;
+          const data = await env.MEMBERS_KV.get(key, { type: 'json' });
+  
+          if (!data || (now - data.timestamp > RATE_LIMITS.windows[window])) {
+              return { window, data: { tokens: 0, requests: 0, timestamp: now } };
+          }
+          return { window, data };
+      });
+  
+      const resolved = await Promise.all(promises);
+      for (const { window, data } of resolved) {
+          results[window] = data;
+      }
+  
+      return results;
+  }
+  
+  /**
+   * Check rate limits for an authenticated user
+   * @returns {Object} { allowed: boolean, reason?, window?, limit?, used?, retryAfter?, tier }
+   */
+  async function checkUserRateLimits(env, userId, tier) {
+      const limits = getRateLimitsForTier(tier);
+      const usage = await getUserRateLimitUsage(env, userId);
+      const now = Date.now();
+  
+      const checks = [
+          {
+              window: 'minute',
+              tokenLimit: limits.tokens.perMinute * limits.burstMultiplier,
+              requestLimit: limits.requests.perMinute * limits.burstMultiplier,
+              usage: usage.minute
+          },
+          {
+              window: 'hour',
+              tokenLimit: limits.tokens.perHour,
+              requestLimit: limits.requests.perHour,
+              usage: usage.hour
+          },
+          {
+              window: 'day',
+              tokenLimit: limits.tokens.perDay,
+              requestLimit: limits.requests.perDay,
+              usage: usage.day
+          }
+      ];
+  
+      for (const check of checks) {
+          // Check token limit
+          if (check.usage.tokens >= check.tokenLimit) {
+              const retryAfter = Math.ceil((RATE_LIMITS.windows[check.window] - (now - check.usage.timestamp)) / 1000);
+              return {
+                  allowed: false,
+                  reason: 'tokens',
+                  window: check.window,
+                  limit: check.tokenLimit,
+                  used: check.usage.tokens,
+                  retryAfter: Math.max(1, retryAfter),
+                  tier
+              };
+          }
+  
+          // Check request limit
+          if (check.usage.requests >= check.requestLimit) {
+              const retryAfter = Math.ceil((RATE_LIMITS.windows[check.window] - (now - check.usage.timestamp)) / 1000);
+              return {
+                  allowed: false,
+                  reason: 'requests',
+                  window: check.window,
+                  limit: check.requestLimit,
+                  used: check.usage.requests,
+                  retryAfter: Math.max(1, retryAfter),
+                  tier
+              };
+          }
+      }
+  
+      return { allowed: true, usage, tier };
+  }
+  
+  /**
+   * Handle GET /members/api/rate-limit - Get current rate limit status
+   */
+  async function handleGetRateLimit(request, env) {
+      const user = await authenticateRequest(request, env);
+      if (!user) {
+          return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+      }
+  
+      const tier = user.tier || 'new';
+      const limits = getRateLimitsForTier(tier);
+      const usage = await getUserRateLimitUsage(env, user.id);
+      const now = Date.now();
+  
+      const windowLabels = { minute: 'per minute', hour: 'per hour', day: 'per day' };
+  
+      const response = {
+          user_id: user.id,
+          tier,
+          limits: {
+              tokens: limits.tokens,
+              requests: limits.requests
+          },
+          usage: {
+              minute: {
+                  tokens: usage.minute.tokens,
+                  requests: usage.minute.requests,
+                  remaining_tokens: Math.max(0, limits.tokens.perMinute * limits.burstMultiplier - usage.minute.tokens),
+                  remaining_requests: Math.max(0, limits.requests.perMinute * limits.burstMultiplier - usage.minute.requests),
+                  resets_in: Math.max(0, Math.ceil((RATE_LIMITS.windows.minute - (now - usage.minute.timestamp)) / 1000))
+              },
+              hour: {
+                  tokens: usage.hour.tokens,
+                  requests: usage.hour.requests,
+                  remaining_tokens: Math.max(0, limits.tokens.perHour - usage.hour.tokens),
+                  remaining_requests: Math.max(0, limits.requests.perHour - usage.hour.requests),
+                  resets_in: Math.max(0, Math.ceil((RATE_LIMITS.windows.hour - (now - usage.hour.timestamp)) / 1000))
+              },
+              day: {
+                  tokens: usage.day.tokens,
+                  requests: usage.day.requests,
+                  remaining_tokens: Math.max(0, limits.tokens.perDay - usage.day.tokens),
+                  remaining_requests: Math.max(0, limits.requests.perDay - usage.day.requests),
+                  resets_in: Math.max(0, Math.ceil((RATE_LIMITS.windows.day - (now - usage.day.timestamp)) / 1000))
+              }
+          }
+      };
+  
+      return jsonResponse(response, 200, getCorsHeaders(request));
+  }
+  
+  /**
+   * Handle POST /members/api/rate-limit/check - Check if user can make a request
+   */
+  async function handleCheckRateLimit(request, env) {
+      // Support both authenticated and API key validation
+      let userId, tier;
+  
+      // Try API key first
+      const apiKey = request.headers.get("X-API-Key") ||
+                     request.headers.get("Authorization")?.replace("Bearer ", "");
+  
+      if (apiKey && apiKey.startsWith('g4f_')) {
+          const keyHash = await hashApiKey(apiKey);
+          const keyDataStr = await env.MEMBERS_KV.get(`api_key:${keyHash}`);
+          
+          if (keyDataStr) {
+              const keyData = JSON.parse(keyDataStr);
+              userId = keyData.user_id;
+              tier = keyData.tier || 'new';
+          }
+      }
+  
+      // Fall back to session authentication
+      if (!userId) {
+          const user = await authenticateRequest(request, env);
+          if (user) {
+              userId = user.id;
+              tier = user.tier || 'new';
+          }
+      }
+  
+      if (!userId) {
+          return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+      }
+  
+      const rateCheck = await checkUserRateLimits(env, userId, tier);
+  
+      if (!rateCheck.allowed) {
+          const windowLabels = { minute: 'per minute', hour: 'per hour', day: 'per day' };
+          const message = rateCheck.reason === 'tokens'
+              ? `Token limit (${rateCheck.limit.toLocaleString()} ${windowLabels[rateCheck.window]}) exceeded for ${tier} tier. Used: ${rateCheck.used.toLocaleString()} tokens.`
+              : `Request limit (${rateCheck.limit} ${windowLabels[rateCheck.window]}) exceeded for ${tier} tier. Made: ${rateCheck.used} requests.`;
+  
+          return jsonResponse({
+              allowed: false,
+              error: {
+                  message,
+                  type: 'rate_limit_exceeded',
+                  tier: rateCheck.tier,
+                  window: rateCheck.window,
+                  limit: rateCheck.limit,
+                  used: rateCheck.used,
+                  retry_after: rateCheck.retryAfter
+              }
+          }, 429, {
+            "Retry-After": rateCheck.retryAfter.toString(),
+            "X-User-Tier": tier,
+            ...getCorsHeaders(request)
+        });
+      }
+  
+      return jsonResponse({
+          allowed: true,
+          tier,
+          usage: rateCheck.usage
+      }, 200, getCorsHeaders(request));
+  }
+
+  
+  // ============================================
+  // Conversation Cloud Sync
+  // ============================================
+  
+  /**
+   * Handle GET /members/api/conversations - List all synced conversations
+   */
+  async function handleListConversations(request, env) {
+      const user = await authenticateRequest(request, env);
+      if (!user) {
+          return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+      }
+  
+      try {
+          // List all conversations from R2 for this user
+          const prefix = `conversations/${user.id}/`;
+          const listed = await env.MEMBERS_BUCKET.list({ prefix });
+          
+          const conversations = [];
+          for (const object of listed.objects) {
+              try {
+                  // Get full conversation content
+                  const convObject = await env.MEMBERS_BUCKET.get(object.key);
+                  if (convObject) {
+                      const convData = await convObject.json();
+                      conversations.push(convData);
+                  }
+              } catch (e) {
+                  console.error("Failed to load conversation:", object.key, e);
+              }
+          }
+  
+          // Sort by updated/added time, newest first
+          conversations.sort((a, b) => (b.updated || b.added || 0) - (a.updated || a.added || 0));
+  
+          return jsonResponse({ 
+              conversations,
+              count: conversations.length
+          }, 200, getCorsHeaders(request));
+      } catch (error) {
+          console.error("Failed to list conversations:", error);
+          return jsonResponse({ error: "Failed to list conversations" }, 500, getCorsHeaders(request));
+      }
+  }
+  
+  /**
+   * Handle POST /members/api/conversations - Sync conversations to cloud
+   */
+  async function handleSyncConversations(request, env) {
+      const user = await authenticateRequest(request, env);
+      if (!user) {
+          return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+      }
+  
+      if (request.method !== "POST") {
+          return jsonResponse({ error: "Method not allowed" }, 405, getCorsHeaders(request));
+      }
+  
+      try {
+          const body = await request.json();
+          const { conversations } = body;
+  
+          if (!Array.isArray(conversations)) {
+              return jsonResponse({ error: "conversations must be an array" }, 400, getCorsHeaders(request));
+          }
+  
+          // Limit number of conversations to sync (prevent abuse)
+          const MAX_CONVERSATIONS = 1000;
+          if (conversations.length > MAX_CONVERSATIONS) {
+              return jsonResponse({ 
+                  error: `Maximum ${MAX_CONVERSATIONS} conversations allowed` 
+              }, 400, getCorsHeaders(request));
+          }
+  
+          const results = [];
+          const now = new Date().toISOString();
+  
+          for (const conv of conversations) {
+              if (!conv.id) {
+                  results.push({ id: null, success: false, error: "Missing conversation ID" });
+                  continue;
+              }
+  
+              try {
+                  // Store conversation in R2
+                  const key = `conversations/${user.id}/${conv.id}.json`;
+                  await env.MEMBERS_BUCKET.put(
+                      key,
+                      JSON.stringify({
+                          ...conv,
+                          synced_at: now,
+                          user_id: user.id
+                      }),
+                      {
+                          httpMetadata: {
+                              contentType: "application/json",
+                              cacheControl: now
+                          }
+                      }
+                  );
+                  results.push({ id: conv.id, success: true });
+              } catch (err) {
+                  results.push({ id: conv.id, success: false, error: err.message });
+              }
+          }
+  
+          const successCount = results.filter(r => r.success).length;
+          return jsonResponse({
+              message: `Synced ${successCount} of ${conversations.length} conversations`,
+              results
+          }, 200, getCorsHeaders(request));
+      } catch (error) {
+          console.error("Failed to sync conversations:", error);
+          return jsonResponse({ error: "Failed to sync conversations" }, 500, getCorsHeaders(request));
+      }
+  }
+  
+  /**
+   * Handle GET /members/api/conversations/:id - Get a specific conversation
+   */
+  async function handleGetConversation(request, env, conversationId) {
+      const user = await authenticateRequest(request, env);
+      if (!user) {
+          return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+      }
+  
+      try {
+          const key = `conversations/${user.id}/${conversationId}.json`;
+          const object = await env.MEMBERS_BUCKET.get(key);
+  
+          if (!object) {
+              return jsonResponse({ error: "Conversation not found" }, 404, getCorsHeaders(request));
+          }
+  
+          const conversation = await object.json();
+          return jsonResponse({ conversation }, 200, getCorsHeaders(request));
+      } catch (error) {
+          console.error("Failed to get conversation:", error);
+          return jsonResponse({ error: "Failed to get conversation" }, 500, getCorsHeaders(request));
+      }
+  }
+  
+  /**
+   * Handle DELETE /members/api/conversations/:id - Delete a synced conversation
+   */
+  async function handleDeleteConversation(request, env, conversationId) {
+      const user = await authenticateRequest(request, env);
+      if (!user) {
+          return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+      }
+  
+      try {
+          const key = `conversations/${user.id}/${conversationId}.json`;
+          await env.MEMBERS_BUCKET.delete(key);
+  
+          return jsonResponse({ message: "Conversation deleted successfully" }, 200, getCorsHeaders(request));
+      } catch (error) {
+          console.error("Failed to delete conversation:", error);
+          return jsonResponse({ error: "Failed to delete conversation" }, 500, getCorsHeaders(request));
+      }
+  }
+
+  /**
+   * Handle GET /members/api/jwt - Generate a JWT token for the authenticated user
+   * The token is used for cross-worker authentication (e.g., discord-mirror-worker)
+   * 
+   * Returns: { token: "<jwt>", expires: <timestamp> }
+   */
+  async function handleJwtRequest(request, env) {
+    const user = await authenticateRequest(request, env);
+    if (!user) {
+        return jsonResponse({ error: "Unauthorized" }, 401, getCorsHeaders(request));
+    }
+
+    if (request.method !== "GET") {
+        return jsonResponse({ error: "Method not allowed" }, 405, getCorsHeaders(request));
+    }
+
+    // JWT Expiry: 24 hours
+    const expires = Math.floor(Date.now() / 1000) + (24 * 60 * 60);
+    
+    const header = { alg: "HS256", typ: "JWT" };
+    const payload = {
+        sub: user.id,
+        provider: user.provider,
+        username: user.username,
+        tier: user.tier,
+        exp: expires,
+        iat: Math.floor(Date.now() / 1000)
+    };
+
+    const encode = (obj) => btoa(JSON.stringify(obj)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    
+    const unsignedToken = `${encode(header)}.${encode(payload)}`;
+    
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+        "raw",
+        encoder.encode(env.JWT_SECRET),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+    );
+
+    const signatureBuffer = await crypto.subtle.sign(
+        "HMAC",
+        key,
+        encoder.encode(unsignedToken)
+    );
+    
+    const signature = Array.from(new Uint8Array(signatureBuffer))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+    
+    // Note: The discord-mirror-worker expects a standard JWT signature (base64url encoded bytes)
+    // Let's use the correct base64url encoding for the signature to match standard JWT
+    const signatureBase64 = toBase64Url(signatureBuffer);
+    const token = `${unsignedToken}.${signatureBase64}`;
+
+    return jsonResponse({
+        token,
+        expires
+    }, 200, getCorsHeaders(request));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Secret request endpoints — cross-device workspace secret sharing
+  //
+  // Storage layout in R2:
+  //   secret/<user_id>/secret_requests/<request_id>.json
+  //
+  // Lifecycle:
+  //   pending  →  confirmed  →  completed (polled & cleaned up)
+  //
+  // Mirrors the Python API endpoints at /v1/secret/request*.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Authenticate via x-user-id header (used by secret request endpoints).
+   * Returns the user object or null.
+   */
+  async function authenticateByUserId(request, env) {
+    const userId = request.headers.get("x-user-id");
+    if (!userId) return null;
+    const user = await getUser(env, userId);
+    return user || null;
+  }
+
+  /**
+   * Generate a 12-char hex request ID (matches Python uuid.uuid4().hex[:12]).
+   */
+  function generateSecretRequestId() {
+    const array = new Uint8Array(6);
+    crypto.getRandomValues(array);
+    return Array.from(array, byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  /**
+   * List all secret request files for a user, cleaning up expired ones.
+   */
+  async function listSecretRequestObjects(env, userId) {
+    const prefix = `secret/${userId}/secret_requests/`;
+    const listed = await env.MEMBERS_BUCKET.list({ prefix });
+    return listed;
+  }
+
+  /**
+   * Handle POST /members/api/secret/request
+   * Create a pending secret-sharing request from a new device.
+   */
+  async function handleCreateSecretRequest(request, env) {
+    const user = await authenticateByUserId(request, env);
+    if (!user) {
+      return jsonResponse({ error: "User ID is required (provide x-user-id header)" }, 401, getCorsHeaders(request));
+    }
+
+    let deviceName = "unknown";
+    try {
+      const body = await request.json();
+      if (body && body.device_name) deviceName = body.device_name;
+    } catch (e) {
+      // body is optional
+    }
+
+    const requestId = generateSecretRequestId();
+    const now = Date.now() / 1000;
+    const requestData = {
+      id: requestId,
+      user_id: user.id,
+      device_name: deviceName,
+      status: "pending",
+      created: now,
+      expires: now + 300, // 5-minute expiry
+      secret: null
+    };
+
+    const key = `secret/${user.id}/secret_requests/${requestId}.json`;
+    await env.MEMBERS_BUCKET.put(
+      key,
+      JSON.stringify(requestData),
+      { httpMetadata: { contentType: "application/json" } }
+    );
+
+    return jsonResponse({ request_id: requestId, status: "pending" }, 200, getCorsHeaders(request));
+  }
+
+  /**
+   * Handle GET /members/api/secret/requests
+   * List all pending secret-sharing requests for the online device.
+   * Expired requests are automatically removed.
+   */
+  async function handleListSecretRequests(request, env) {
+    const user = await authenticateByUserId(request, env);
+    if (!user) {
+      return jsonResponse({ error: "User ID is required (provide x-user-id header)" }, 401, getCorsHeaders(request));
+    }
+
+    try {
+      const listed = await listSecretRequestObjects(env, user.id);
+      const now = Date.now() / 1000;
+      const requests = [];
+
+      for (const object of listed.objects) {
+        try {
+          const obj = await env.MEMBERS_BUCKET.get(object.key);
+          if (!obj) continue;
+          const data = await obj.json();
+
+          // Clean up expired non-completed requests
+          if (data.expires < now && data.status !== "completed") {
+            await env.MEMBERS_BUCKET.delete(object.key);
+            continue;
+          }
+
+          // Don't expose the secret in the list
+          const safe = { ...data };
+          delete safe.secret;
+          requests.push(safe);
+        } catch (e) {
+          console.error("Failed to load secret request:", object.key, e);
+        }
+      }
+
+      // Sort by created time, newest first
+      requests.sort((a, b) => (b.created || 0) - (a.created || 0));
+
+      return jsonResponse({ requests }, 200, getCorsHeaders(request));
+    } catch (error) {
+      console.error("Failed to list secret requests:", error);
+      return jsonResponse({ error: "Failed to list secret requests" }, 500, getCorsHeaders(request));
+    }
+  }
+
+  /**
+   * Handle POST /members/api/secret/request/confirm
+   * Confirm a pending secret request by providing the workspace secret.
+   * Called by the online device that already has the secret.
+   */
+  async function handleConfirmSecretRequest(request, env) {
+    const user = await authenticateByUserId(request, env);
+    if (!user) {
+      return jsonResponse({ error: "User ID is required (provide x-user-id header)" }, 401, getCorsHeaders(request));
+    }
+
+    let body;
+    try {
+      body = await request.json();
+    } catch (e) {
+      return jsonResponse({ error: "Invalid JSON body" }, 400, getCorsHeaders(request));
+    }
+
+    const requestId = body.request_id;
+    const workspaceSecret = body.workspace_secret;
+    if (!requestId || !workspaceSecret) {
+      return jsonResponse({ error: "request_id and workspace_secret are required" }, 400, getCorsHeaders(request));
+    }
+
+    // Sanitize request ID to prevent path traversal
+    const safeId = requestId.replace(/[^a-f0-9]/gi, "");
+    if (!safeId) {
+      return jsonResponse({ error: "Invalid request_id" }, 400, getCorsHeaders(request));
+    }
+
+    const key = `secret/${user.id}/secret_requests/${safeId}.json`;
+    const object = await env.MEMBERS_BUCKET.get(key);
+
+    if (!object) {
+      return jsonResponse({ error: "Request not found" }, 404, getCorsHeaders(request));
+    }
+
+    let data;
+    try {
+      data = await object.json();
+    } catch (e) {
+      return jsonResponse({ error: "Invalid request file" }, 500, getCorsHeaders(request));
+    }
+
+    if (data.status !== "pending") {
+      return jsonResponse({ error: `Request is not pending (status=${data.status})` }, 400, getCorsHeaders(request));
+    }
+
+    data.status = "confirmed";
+    data.secret = workspaceSecret;
+    data.confirmed_at = Date.now() / 1000;
+
+    await env.MEMBERS_BUCKET.put(
+      key,
+      JSON.stringify(data),
+      { httpMetadata: { contentType: "application/json" } }
+    );
+
+    return jsonResponse({ confirmed: true, request_id: safeId }, 200, getCorsHeaders(request));
+  }
+
+  /**
+   * Handle GET /members/api/secret/request/:id
+   * Poll a secret request to check if it has been confirmed.
+   * Returns the request data including the secret if confirmed.
+   * If the secret has been retrieved, the request is cleaned up.
+   */
+  async function handlePollSecretRequest(request, env, requestId) {
+    const user = await authenticateByUserId(request, env);
+    if (!user) {
+      return jsonResponse({ error: "User ID is required (provide x-user-id header)" }, 401, getCorsHeaders(request));
+    }
+
+    const safeId = requestId.replace(/[^a-f0-9]/gi, "");
+    if (!safeId) {
+      return jsonResponse({ status: "not_found" }, 404, getCorsHeaders(request));
+    }
+
+    const key = `secret/${user.id}/secret_requests/${safeId}.json`;
+    const object = await env.MEMBERS_BUCKET.get(key);
+
+    if (!object) {
+      return jsonResponse({ status: "not_found" }, 200, getCorsHeaders(request));
+    }
+
+    let data;
+    try {
+      data = await object.json();
+    } catch (e) {
+      return jsonResponse({ status: "error", error: "Invalid request file" }, 500, getCorsHeaders(request));
+    }
+
+    const now = Date.now() / 1000;
+
+    // Clean up expired non-completed requests
+    if (data.expires < now && data.status !== "completed") {
+      await env.MEMBERS_BUCKET.delete(key);
+      return jsonResponse({ status: "expired" }, 200, getCorsHeaders(request));
+    }
+
+    if (data.status === "confirmed") {
+      // Mark as completed and clean up
+      await env.MEMBERS_BUCKET.delete(key);
+      return jsonResponse({
+        status: "confirmed",
+        secret: data.secret,
+        request_id: safeId
+      }, 200, getCorsHeaders(request));
+    }
+
+    return jsonResponse({
+      status: data.status || "pending",
+      request_id: safeId
+    }, 200, getCorsHeaders(request));
+  }
+
+  /**
+   * Handle DELETE /members/api/secret/request/:id
+   * Cancel / delete a secret-sharing request.
+   */
+  async function handleDeleteSecretRequest(request, env, requestId) {
+    const user = await authenticateByUserId(request, env);
+    if (!user) {
+      return jsonResponse({ error: "User ID is required (provide x-user-id header)" }, 401, getCorsHeaders(request));
+    }
+
+    const safeId = requestId.replace(/[^a-f0-9]/gi, "");
+    if (!safeId) {
+      return jsonResponse({ error: "Request not found" }, 404, getCorsHeaders(request));
+    }
+
+    const key = `secret/${user.id}/secret_requests/${safeId}.json`;
+    const object = await env.MEMBERS_BUCKET.get(key);
+
+    if (!object) {
+      return jsonResponse({ error: "Request not found" }, 404, getCorsHeaders(request));
+    }
+
+    await env.MEMBERS_BUCKET.delete(key);
+    return jsonResponse({ deleted: true, request_id: safeId }, 200, getCorsHeaders(request));
+  }

@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>G4F Custom Server — reference implementation</title>
+<style>
+  :root { --bg:#0b0f17; --panel:#121826; --line:#232c3f; --text:#e8edf7; --dim:#8b98b8; --acc:#4f8cff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 20px 16px 60px; }
+  h1 { font-size: 20px; margin: 8px 0 2px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 18px; }
+  .card { background: var(--panel); border:1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  select, button, input[type=text] {
+    background:#0e1420; color:var(--text); border:1px solid var(--line);
+    border-radius: 10px; padding: 9px 12px; font-size: 14px; outline:none;
+  }
+  select:focus, input:focus { border-color: var(--acc); }
+  button { cursor:pointer; }
+  button.primary { background: var(--acc); border-color: var(--acc); color:#fff; font-weight:600; }
+  button:disabled { opacity:.5; cursor:default; }
+  label { font-size: 12px; color: var(--dim); display:block; margin-bottom:4px; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .meta { font-size: 12px; color: var(--dim); margin-top:8px; }
+  .chat { margin-top: 16px; }
+  .msg { border:1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { border-left: 3px solid var(--acc); }
+  .msg.ai { border-left: 3px solid #2ecc71; }
+  .msg .tag { font-size: 11px; color: var(--dim); margin-bottom: 4px; }
+  .banner { margin-top: 14px; font-size: 13px; color: var(--dim); line-height: 1.5; }
+  code { background:#0e1420; padding: 2px 6px; border-radius: 6px; font-size: 12px; }
+  .status-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🌐 G4F Custom Server — reference implementation</h1>
+  <div class="sub">
+    A working re-implementation of the <code>gpt4free/g4f.dev</code> custom-server feature
+    (the <code>#custom:srv_…</code> flow). Pick a server + model and chat — exactly like
+    <code>https://g4f.dev/chat/</code>, but against a local router.
+  </div>
+
+  <div class="card">
+    <div class="grid">
+      <div>
+        <label>Provider (custom server)</label>
+        <select id="provider"></select>
+      </div>
+      <div>
+        <label>Model</label>
+        <select id="model"></select>
+      </div>
+    </div>
+    <div class="meta" id="meta"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="reload-servers" title="Re-fetch /custom/api/servers/public + /custom/api/servers">↻ Reload servers</button>
+      <button id="test-server" title="Sends the 'Server?' ping the g4f.dev worker answers with the server identity">🧪 Test: “Server?”</button>
+    </div>
+  </div>
+
+  <div class="card chat">
+    <div id="messages"><div class="msg ai"><div class="tag">assistant</div>Hi! I'm the reference router. Pick a provider + model above and say something — streaming works too.</div></div>
+    <div class="row">
+      <input type="text" id="prompt" style="flex:1" placeholder="Type a message… (Enter to send)"/>
+      <button class="primary" id="send">Send</button>
+      <button id="clear">Clear</button>
+    </div>
+  </div>
+
+  <div class="banner">
+    How this mirrors g4f.dev: the browser calls <code>POST /custom/{srv_id}/chat/completions</code>
+    (with your <code>g4f_session</code> as Bearer token); the router looks the server up in the
+    public index / your private servers, picks a random key from the <em>owner's</em> key pool,
+    proxies to the upstream (here: a local mock of cakey's <code>osaii.wyvernhub.net</code> relay),
+    streams SSE back, and records usage. See <code>../01-ARCHITECTURE.md</code> for the full deep dive.
+  </div>
+</div>
+
+<script>
+const SESSION = "g4f_demo_session_token";
+const $ = id => document.getElementById(id);
+const providerSel = $("provider"), modelSel = $("model"), meta = $("meta");
+const messagesEl = $("messages"), promptEl = $("prompt"), sendBtn = $("send");
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + SESSION },
+    ...opts,
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data;
+}
+
+async function loadServers() {
+  try {
+    const [pub, priv] = await Promise.all([
+      api("/custom/api/servers/public"),
+      api("/custom/api/servers").catch(() => ({ servers: [] })),
+    ]);
+    const seen = new Set();
+    const all = [];
+    for (const s of [...(priv.servers || []), ...(pub.servers || [])]) {
+      if (seen.has(s.id)) continue;
+      seen.add(s.id);
+      all.push(s);
+    }
+    providerSel.innerHTML = "";
+    for (const s of all) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      opt.textContent = `${s.label} 🌐 (${(s.allowed_models || []).length} models)`;
+      opt.dataset.id = s.id;
+      providerSel.appendChild(opt);
+    }
+    if (!all.length) providerSel.innerHTML = '<option value="">(no custom servers found)</option>';
+    await loadModels();
+  } catch (e) {
+    meta.textContent = "Failed to load servers: " + e.message;
+  }
+}
+
+async function loadModels() {
+  modelSel.innerHTML = '<option value="">loading…</option>';
+  const id = providerSel.value;
+  if (!id) { modelSel.innerHTML = '<option value="">—</option>'; meta.textContent = ""; return; }
+  try {
+    const data = await api(`/custom/${id}/models`);
+    modelSel.innerHTML = "";
+    const list = data.data || [];
+    for (const m of list) {
+      const opt = document.createElement("option");
+      opt.value = m.id;
+      opt.textContent = m.id + (m.requests ? `  (${m.requests} reqs)` : "");
+      modelSel.appendChild(opt);
+    }
+    if (!list.length) modelSel.innerHTML = '<option value="">(no models)</option>';
+    const s = [...providerSel.options].find(o => o.value === id);
+    meta.innerHTML = `server <code>${id}</code> — ${(s ? s.textContent : "").split("🌐")[0].trim()} · ${list.length} models · sorted by usage (as on g4f.dev)`;
+  } catch (e) {
+    modelSel.innerHTML = '<option value="">model error</option>';
+    meta.textContent = e.message;
+  }
+}
+
+function addMsg(role, tag, text) {
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  div.innerHTML = `<div class="tag">${tag}</div>`;
+  const body = document.createElement("div");
+  body.textContent = text;
+  div.appendChild(body);
+  messagesEl.appendChild(div);
+  return body;
+}
+
+async function send(text) {
+  const id = providerSel.value, model = modelSel.value;
+  if (!id || !model) return;
+  promptEl.value = "";
+  addMsg("user", "you", text);
+  const bodyEl = addMsg("ai", `assistant · ${model}`, "…");
+  sendBtn.disabled = true;
+  const controller = new AbortController();
+  try {
+    const r = await fetch(`/custom/${id}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + SESSION },
+      body: JSON.stringify({ model, stream: true,
+        messages: [{ role: "user", content: text }] }),
+      signal: controller.signal,
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status + " " + (await r.text()).slice(0, 200));
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let acc = "";
+    bodyEl.textContent = "";
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const payload = line.slice(6);
+        if (payload === "[DONE]") continue;
+        try {
+          const chunk = JSON.parse(payload);
+          const delta = chunk.choices?.[0]?.delta?.content;
+          if (delta) { acc += delta; bodyEl.textContent = acc; }
+        } catch {}
+      }
+    }
+    if (!acc) bodyEl.textContent = "(empty response)";
+  } catch (e) {
+    bodyEl.textContent = "Error: " + e.message;
+  } finally {
+    sendBtn.disabled = false;
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+}
+
+$("send").onclick = () => send(promptEl.value.trim());
+promptEl.addEventListener("keydown", e => { if (e.key === "Enter" && promptEl.value.trim()) send(promptEl.value.trim()); });
+$("clear").onclick = () => messagesEl.innerHTML = "";
+$("reload-servers").onclick = loadServers;
+$("test-server").onclick = () => send("Server?");
+providerSel.onchange = loadModels;
+
+loadServers();
+</script>
+</body>
+</html>
