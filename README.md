@@ -7,6 +7,11 @@ plus a **48-model web chatbot** built on top of the research — one Python
 backend, one frontend, one web URL — where **17 of the 48 models are real
 reasoning models** that stream their thinking.
 
+> **Want the whole route in one deepened doc** — how the g4f.dev feature was
+> reverse-engineered from zero info, how the real API works line by line, all
+> the data, and how every part of this repo works? Read
+> **[route.md](route.md)** — the master document.
+
 ---
 
 ## Table of contents
