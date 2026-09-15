@@ -36,7 +36,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 BASE = Path(__file__).parent
-FRONTEND = BASE / "frontend"
+FRONTEND = BASE.parent / "route-web"  # frontend lives in the sibling route-web/ folder
 STATS_FILE = BASE / "usage.json"
 
 # --- optional real upstream (OpenAI-compatible) ----------------------------
@@ -324,7 +324,7 @@ ID_RE = re.compile(r"\b(who are you|what are you|what model|your name|introduce 
 # thinking traces — how each reasoning model "shows its work"
 # (mirrors the real extraction formats: GLM/Kimi/Qwen/DeepSeek expose a
 #  visible chain in `reasoning_content`; GPT-5 exposes a short summary;
-#  gpt-oss streams raw CoT — see g4f-custom-server-deep-dive/04-REASONING-MODELS.md)
+#  gpt-oss streams raw CoT — see research/04-REASONING-MODELS.md)
 # ---------------------------------------------------------------------------
 def make_thinking(model: dict, last: str, seed: int) -> str:
     q = last if len(last) <= 110 else last[:107] + "…"

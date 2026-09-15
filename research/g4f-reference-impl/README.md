@@ -1,4 +1,4 @@
-# reference-impl — working re-implementation of the g4f.dev custom-server feature
+# g4f-reference-impl — working re-implementation of the g4f.dev custom-server feature
 
 A "deepened" Python/FastAPI port of the custom-server logic in
 `gpt4free/g4f.dev` `workers/api-worker.js`, with the 10 bugs from

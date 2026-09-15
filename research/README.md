@@ -17,7 +17,7 @@ Researched 2026-09-13 from the live site + the repo at commit `9d075d7`.
 | [`fixes/g4f-dev-custom-server-fixes.patch`](fixes/g4f-dev-custom-server-fixes.patch) | Ready-to-apply git patch for `gpt4free/g4f.dev` with all fixes (syntax-checked with `node --check`) |
 | [`sources/`](sources/) | Copies of every key source file: the backend worker, auth worker, frontend addons, provider registry, config |
 | [`live-data/`](live-data/) | Raw production snapshots (cakey's server entry, models, status) |
-| [`reference-impl/`](reference-impl/) | **Working "deepened" re-implementation** in Python/FastAPI — run it, test it (32-check E2E suite), play with the chat UI |
+| [`g4f-reference-impl/`](g4f-reference-impl/) | **Working "deepened" re-implementation** in Python/FastAPI — run it, test it (32-check E2E suite), play with the chat UI |
 
 ## The 60-second version
 
@@ -42,7 +42,7 @@ Researched 2026-09-13 from the live site + the repo at commit `9d075d7`.
 ## Try it yourself
 
 ```bash
-cd reference-impl
+cd g4f-reference-impl
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ./run.sh                     # mock upstream :9101 + router/UI :8090
 .venv/bin/python test_e2e.py # 32 end-to-end checks

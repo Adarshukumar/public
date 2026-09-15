@@ -84,7 +84,7 @@ endpoints.
 `POST /custom/{srv_id}/chat/completions` could **not** be exercised from this sandbox
 (direct egress to `g4f.space` is TLS-blocked here; only the page-fetch tool reaches it).
 The POST path was instead verified byte-for-byte against the source and re-implemented +
-fully tested in `reference-impl/` (32/32 checks, including the SSE usage capture and the
+fully tested in `g4f-reference-impl/` (32/32 checks, including the SSE usage capture and the
 `Server?` identity ping that the production code performs at `api-worker.js:1319`).
 
 ## Where this sits among all public servers

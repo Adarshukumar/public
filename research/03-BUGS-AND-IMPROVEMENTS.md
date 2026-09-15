@@ -229,7 +229,7 @@ battery's first run actually tripped this in production-parity code).
 ```
 $ node --check workers/api-worker.js        # OK
 $ node --check dist/js/addons/addon-init.js # OK
-$ .venv/bin/python reference-impl/test_e2e.py
+$ python3 g4f-reference-impl/test_e2e.py
 …
 ALL 32 CHECKS PASSED ✅
 ```

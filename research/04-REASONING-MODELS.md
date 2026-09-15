@@ -1,6 +1,6 @@
 # 04 — Reasoning / "Thinking" Models: Which of the 48 Actually Think, and How the Thinking Is Extracted
 
-*Deep-dive companion to the chatbot (`/chatbot`), 2026-09-15.*
+*Deep-dive companion to the chatbot (`route-py/` + `route-web/`), 2026-09-15.*
 
 Question answered: **of the 48 models on cakey's relay, which ones are real
 reasoning models, and what is the "extraction process" — how does a client
@@ -190,4 +190,4 @@ non-streaming:
 - xAI — Reasoning docs (docs.x.ai, Aug 2026): effort levels incl. xhigh, summary/text deltas; Grok 4 no-trace behavior (datacamp.com tutorial, July 2025); grok-4-1-fast rejecting `reasoningEffort` (hermes-agent issue #23088, May 2026).
 - Google — Gemini thinking docs (ai.google.dev): `thinkingBudget` 2.5, `thinkingLevel` 3, `include_thoughts`, flash-lite default-off (help.apiyi.com parameter-evolution table, Jan 2026).
 - GPT-OSS — visible `reasoning` stream field (huggingface.co/openai/gpt-oss-20b discussion #28, Aug 2025).
-- g4f.dev pass-through — local source: `g4f-custom-server-deep-dive/sources/api-worker.js` (proxy = raw fetch forward, extra fields untouched).
+- g4f.dev pass-through — local source: `research/sources/workers/api-worker.js` (proxy = raw fetch forward, extra fields untouched).
