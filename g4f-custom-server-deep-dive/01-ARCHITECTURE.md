@@ -195,7 +195,7 @@ Every call to `/custom/api/servers/public` (and it's called on **every chat page
   `updated_at` stamped (see bug #4: the production code stamps *before* validating),
 * the result is cached in `caches.default` for up to 24h when nothing was refreshed.
 
-That's how cakey's 45-model list stays current: `auto_update_models: true` + hourly refresh
+That's how cakey's 48-model list stays current: `auto_update_models: true` + hourly refresh
 + `GET /models` refreshes on every model-list request.
 
 ## 4. Frontend: from URL to answer

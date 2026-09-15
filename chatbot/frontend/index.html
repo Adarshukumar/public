@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>G4F Model Router — 48-model chatbot</title>
+<link rel="stylesheet" href="/static/style.css"/>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌐</text></svg>"/>
+</head>
+<body>
+<div id="app">
+  <!-- ============ SIDEBAR: all models ============ -->
+  <aside id="sidebar">
+    <header class="side-head">
+      <div class="logo"><span class="dot" id="status-dot" title="server status"></span>
+        <span class="logo-text">G4F Model Router</span>
+      </div>
+      <div id="mode-badge" class="mode-badge" title="backend mode">…</div>
+    </header>
+    <input id="search" type="search" placeholder="Search 48 models…" autocomplete="off"/>
+    <div id="model-list"></div>
+    <footer class="side-foot" id="side-foot">loading models…</footer>
+  </aside>
+
+  <!-- ============ MAIN: chat ============ -->
+  <main id="main">
+    <header id="topbar">
+      <button id="side-toggle" title="toggle model list">☰</button>
+      <div id="current-model" class="current-model">
+        <span class="cm-name">Pick a model</span>
+        <span class="cm-desc">from the 45 on the left</span>
+      </div>
+      <div class="topbar-actions">
+        <span id="usage-chip" class="chip" title="requests / tokens with the selected model">0 req · 0 tok</span>
+        <button id="new-chat" class="btn">＋ New chat</button>
+      </div>
+    </header>
+
+    <div id="messages">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-logo">🌐</div>
+        <h2>48 models, one chat.</h2>
+        <p>All 48 models from cakey's public g4f server — pick one on the left
+           (Luna, GLM 5.3 Flash, Kimi K3, Grok 4, Laguna, …) and start chatting.
+           Each model has its own voice.</p>
+        <div class="empty-hints">
+          <button class="hint" data-prompt="Explain what you are in one sentence.">“Explain what you are in one sentence.”</button>
+          <button class="hint" data-prompt="Write a python function that checks if a number is prime.">“Write a python function that checks if a number is prime.”</button>
+          <button class="hint" data-prompt="What's 27 × 43?">“What's 27 × 43?”</button>
+        </div>
+      </div>
+    </div>
+
+    <footer id="composer">
+      <div class="composer-box">
+        <textarea id="prompt" rows="1" placeholder="Message the model…  (Enter to send, Shift+Enter for a new line)"></textarea>
+        <button id="send" class="btn primary" title="send">➤</button>
+        <button id="stop" class="btn hidden" title="stop generating">■</button>
+      </div>
+      <div class="composer-meta">
+        <span id="model-meta">no model selected</span>
+      </div>
+    </footer>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

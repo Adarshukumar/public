@@ -21,7 +21,7 @@ from the production backend (`g4f.space`) and saved in [`live-data/`](live-data/
   "usage": { "requests": 119, "tokens": 3518, "last_used": "2026-09-09T12:03:01.032Z" },
   "is_hidden": false,
   "is_valid": true,
-  "allowed_models": [ …45 models… ]
+  "allowed_models": [ …48 models… ]
 }
 ```
 
@@ -40,7 +40,7 @@ their own g4f quota (or cake-credits if anonymous).
 
 So server IDs are time-ordered and collision-safe, and you can date any server from its ID.
 
-## The 45 models (top of the list)
+## The 48 models (top of the list)
 
 Poolside Laguna XS/S 2.1, osaii's own `voicellm` / `faster-experimental` /
 `ultrafast-experimental`, then the "-z" (relay) lineup:
