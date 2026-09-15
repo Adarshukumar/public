@@ -35,7 +35,7 @@ Open `http://localhost:8090` — pick a model on the left, chat on the right.
 
 ## 🧠 Thinking (reasoning) models
 
-**16 of the 48 models are real reasoning models** (GLM 5.3 Flash & 4.7 —
+**17 of the 48 models are real reasoning models** (GLM 5.3 Flash & 4.7 —
 forced thinking, Kimi K3 — always-on, DeepSeek V4 line — unified
 auto-routing, Qwen3.7+ / Qwen3.x flash — hybrid, GPT-5.6 Luna — opaque
 thinking + summary, GPT-OSS — visible reasoning stream). They're flagged

@@ -113,7 +113,7 @@ MODELS = [
     # --- qwen-z (continued) ---
     M("qwen-z/qwen3.7-plus", "Qwen 3.7 Plus", "qwen-z", ["general", "strong"], 131072, "Qwen 3.7 plus tier.", "qwen", True),
     # --- openrouter-z ---
-    M("openrouter-z/qwen3.8-27b", "Qwen 3.8 27B", "openrouter-z", ["general"], 131072, "Qwen 3.8 27B via OpenRouter.", "qwen"),
+    M("openrouter-z/qwen3.8-27b", "Qwen 3.8 27B", "openrouter-z", ["general"], 131072, "Qwen 3.8 27B via OpenRouter.", "qwen", True),
     # --- inception-z ---
     M("inception-z/mercury-2", "Mercury 2", "inception-z", ["experimental"], 32768, "Inception Labs Mercury 2.", "inception"),
     # --- stealth ---
@@ -358,7 +358,7 @@ def make_thinking(model: dict, last: str, seed: int) -> str:
         return ("**Plan.** For “{q}”: identify the single most useful answer, check it against what I know, keep it tight.\n"
                 "**Confidence.** High. Emitting response.").format(q=q)
 
-    if fam == "qwen-z":  # Qwen3: hybrid thinking, compact deliberation
+    if fam == "qwen-z" or style == "qwen":  # Qwen3: hybrid thinking, compact deliberation
         return ("Analyzing: “{q}”.\n"
                 "Thinking — the question is direct; I can answer from what I know without tools. "
                 "I'll state the answer, then give minimal context so it's usable, and I'll avoid over-explaining.\n"

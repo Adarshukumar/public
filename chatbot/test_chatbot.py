@@ -125,7 +125,7 @@ def main():
 
         print("\n[5b] reasoning / thinking models")
         models3 = httpx.get(RT + "/api/models").json()
-        check("catalog reports thinking_models (16)", models3["thinking_models"] == 16,
+        check("catalog reports thinking_models (17)", models3["thinking_models"] == 17,
               str(models3["thinking_models"]))
         check("thinking flag exposed", "thinking" in models3["models"][0])
         # thinking models expose reasoning_content (DeepSeek/Qwen/GLM/Kimi field)

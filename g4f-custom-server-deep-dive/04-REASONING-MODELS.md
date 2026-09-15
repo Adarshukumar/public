@@ -6,7 +6,7 @@ Question answered: **of the 48 models on cakey's relay, which ones are real
 reasoning models, and what is the "extraction process" — how does a client
 actually get the model's thinking out of the API?**
 
-Short answer: **16 of the 48 are thinking models**, and the industry settled on
+Short answer: **17 of the 48 are thinking models**, and the industry settled on
 two extraction patterns:
 
 1. **Visible chain in a side field** — the model's raw thinking stream comes
@@ -123,8 +123,9 @@ Per Z.ai's docs (June 2026):
 | 12 | `qwen-z/qwen3.6-flash` | Qwen3.6 | hybrid, `enable_thinking` | ✅ full CoT |
 | 13 | `qwen-z/qwen3-coder-flash` | Qwen3 Coder | hybrid | ✅ full CoT |
 | 14 | `qwen-z/qwen3.7-plus` | Qwen3.7 | **on by default** | ✅ full CoT |
-| 15 | `groq-z/gpt-oss-120b` | GPT-OSS-120B | medium (open weights) | ✅ raw reasoning stream |
-| 16 | `groq-z/gpt-oss-20b` | GPT-OSS-20B | low | ✅ raw reasoning stream |
+| 15 | `openrouter-z/qwen3.8-27b` | Qwen3.8 27B (via OpenRouter) | hybrid, `enable_thinking` | ✅ full CoT |
+| 16 | `groq-z/gpt-oss-120b` | GPT-OSS-120B | medium (open weights) | ✅ raw reasoning stream |
+| 17 | `groq-z/gpt-oss-20b` | GPT-OSS-20B | low | ✅ raw reasoning stream |
 
 **Not thinking:** `xai-z/*` (both are the non-reasoning/fast tiers; Grok 4.1
 fast rejects the reasoning param), `gemini-z/*` (flash-lite, thinking off by
@@ -133,7 +134,7 @@ default), `openai-z/gpt-5.4-nano` + GPT-4.x nano/mini (small fast models),
 the rest (venice-z, meta-z, microsoft bitnet, osaii, inception, stealth,
 mimo-z, minimax-z, mistral-z, fireworks-z, openrouter-z, qwen-flash-character).
 
-That's **16/48 thinking** — the chatbot flags them with a 🧠 badge and streams
+That's **17/48 thinking** — the chatbot flags them with a 🧠 badge and streams
 their thinking in a collapsible "🧠 thinking…" box before the answer.
 
 ---
@@ -155,7 +156,7 @@ their thinking in a collapsible "🧠 thinking…" box before the answer.
   backend merges into the upstream request. Point it at a real DeepSeek /
   Qwen / GLM / Kimi endpoint and the real model's actual thinking trace
   streams into the 🧠 box — no extra code.
-- **In SIMULATED mode** the 16 thinking models emit a deterministic,
+- **In SIMULATED mode** the 17 thinking models emit a deterministic,
   family-flavored trace in the same field the real vendors use
   (`reasoning_content`), streamed in the same two-phase order (thinking
   deltas first, then answer deltas, then usage + `[DONE]`), with
