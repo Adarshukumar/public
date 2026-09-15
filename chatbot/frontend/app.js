@@ -75,8 +75,8 @@ function renderModels(filter = "") {
       row.innerHTML = `
         <span class="swatch" style="background:${FAMILY_COLORS[m.family] || "#888"}"></span>
         <div style="flex:1;min-width:0">
-          <div class="m-name" title="${esc(m.id)}">${esc(m.name)}</div>
-          <div class="m-tags">${m.tags.slice(0, 3).map(t => `<span class="tag">${esc(t)}</span>`).join("")}</div>
+          <div class="m-name" title="${esc(m.id)}">${esc(m.name)}${m.thinking ? '<span class="think-badge" title="reasoning model — shows its thinking">🧠</span>' : ""}</div>
+          <div class="m-tags">${m.thinking ? '<span class="tag think">thinks</span>' : ""}${m.tags.slice(0, 3).map(t => `<span class="tag">${esc(t)}</span>`).join("")}</div>
         </div>
         <span class="m-count">${m.requests ? fmt(m.requests) : ""}</span>`;
       row.onclick = () => selectModel(m);
@@ -93,7 +93,7 @@ function selectModel(m) {
   topName.textContent = m.name;
   topDesc.textContent = m.description;
   usageChip.textContent = `${m.requests} req · ${fmt(m.tokens)} tok`;
-  modelMeta.textContent = `${m.family} · ${m.context.toLocaleString()} ctx · ${m.tags.join(", ")}`;
+  modelMeta.textContent = `${m.family} · ${m.context.toLocaleString()} ctx · ${m.tags.join(", ")}${m.thinking ? " · 🧠 reasoning model" : ""}`;
   document.querySelectorAll(".model-row").forEach(r => r.classList.remove("active"));
   renderModels(searchEl.value.trim().toLowerCase());
   promptEl.focus();
@@ -121,7 +121,7 @@ function addMsg(role, modelLabel, text, streaming = false) {
 async function send(text) {
   if (!text) return;
   if (!currentModel) {
-    addMsg("ai", "router", "Pick a model from the list on the left first — there are 45 of them. 🙂");
+    addMsg("ai", "router", "Pick a model from the list on the left first — there are 48 of them. 🙂");
     return;
   }
   if (busy) return;
@@ -133,6 +133,27 @@ async function send(text) {
 
   const bubble = addMsg("ai", `${currentModel.name} · ${currentModel.id}`, "", true);
   let acc = "";
+  // --- thinking phase (reasoning models stream delta.reasoning_content first) ---
+  let thinkBox = null, thinkText = null, thinkSum = null, thinkChars = 0, thinkingNow = false;
+  const ensureThinkBox = () => {
+    if (thinkBox) return;
+    thinkBox = document.createElement("details");
+    thinkBox.className = "thinkbox live";
+    thinkBox.open = true;
+    thinkSum = document.createElement("summary");
+    thinkSum.textContent = "🧠 thinking…";
+    thinkText = document.createElement("div");
+    thinkText.className = "think-text";
+    thinkBox.append(thinkSum, thinkText);
+    bubble.parentNode.insertBefore(thinkBox, bubble);
+  };
+  const finishThinkBox = () => {
+    if (!thinkBox) return;
+    thinkingNow = false;
+    thinkBox.open = false;
+    thinkBox.classList.remove("live");
+    thinkSum.textContent = `🧠 thought · ~${Math.max(1, Math.round(thinkChars / 4))} tok — click to expand`;
+  };
   aborter = new AbortController();
   try {
     const r = await fetch("/api/chat", {
@@ -157,8 +178,18 @@ async function send(text) {
         if (p === "[DONE]") continue;
         try {
           const chunk = JSON.parse(p);
-          const delta = chunk.choices?.[0]?.delta?.content;
+          const d = chunk.choices?.[0]?.delta;
+          if (d?.reasoning_content) {          // phase 1 — visible thinking
+            ensureThinkBox();
+            thinkingNow = true;
+            thinkChars += d.reasoning_content.length;
+            thinkText.textContent += d.reasoning_content;
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+            continue;
+          }
+          const delta = d?.content;            // phase 2 — the answer
           if (delta) {
+            if (thinkingNow) finishThinkBox();
             acc += delta;
             bubble.innerHTML = md(acc) + '<span class="caret"></span>';
             messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -172,6 +203,7 @@ async function send(text) {
     else acc = "⚠️ " + e.message;
     bubble.innerHTML = md(acc);
   } finally {
+    if (thinkingNow) finishThinkBox();
     bubble.innerHTML = md(acc || "(stopped)");
     busy = false; aborter = null;
     sendBtn.classList.remove("hidden"); stopBtn.classList.add("hidden");

@@ -47,6 +47,8 @@ def chat(model, text, stream=True):
     r = httpx.post(RT + "/api/chat", timeout=60, json={
         "model": model, "stream": stream,
         "messages": [{"role": "user", "content": text}]})
+    if r.status_code != 200:
+        print(f"  !! {model} -> HTTP {r.status_code}: {r.text[:300]}")
     return r
 
 
@@ -113,6 +115,53 @@ def main():
         check("math answered (1161)", "1161" in d["choices"][0]["message"]["content"])
         d = chat("groq-z/gpt-oss-120b", "give me a python function", stream=False).json()
         check("code detected -> fenced code", "```python" in d["choices"][0]["message"]["content"])
+        for model in ("openai-z/gpt-5.6-luna", "xai-z/grok-4-fast-non-reasoning", "zai-z/zai-org-glm-5-3-flash"):
+            d = chat(model, "what is the capital of France?", stream=False).json()
+            check(f"fact (Paris) via {model.split('/')[1]}", "Paris" in d["choices"][0]["message"]["content"])
+        d = chat("xai-z/grok-4-fast-non-reasoning", "hi", stream=False).json()
+        check("greeting -> in-character self-intro", "Grok 4 Fast" in d["choices"][0]["message"]["content"])
+        d = chat("zai-z/zai-org-glm-5-3-flash", "what is recursion?", stream=False).json()
+        check("fact (recursion) answered", "base case" in d["choices"][0]["message"]["content"])
+
+        print("\n[5b] reasoning / thinking models")
+        models3 = httpx.get(RT + "/api/models").json()
+        check("catalog reports thinking_models (16)", models3["thinking_models"] == 16,
+              str(models3["thinking_models"]))
+        check("thinking flag exposed", "thinking" in models3["models"][0])
+        # thinking models expose reasoning_content (DeepSeek/Qwen/GLM/Kimi field)
+        for model in ("zai-z/zai-org-glm-5-3-flash", "logfare/kimi-k3", "openai-z/gpt-5.6-luna"):
+            d = chat(model, "how many eggs do I need for a dozen muffins?", stream=False).json()
+            rc = d["choices"][0]["message"].get("reasoning_content", "")
+            check(f"{model.split('/')[1]} returns reasoning_content", len(rc) > 30, rc[:60])
+        # non-thinking models don't
+        for model in ("xai-z/grok-4-fast-non-reasoning", "gemini-z/gemini-3.1-flash-lite-preview"):
+            d = chat(model, "hello there", stream=False).json()
+            check(f"{model.split('/')[1]} has no reasoning_content",
+                  "reasoning_content" not in d["choices"][0]["message"])
+        # thinking traces differ per model for the same prompt
+        r1 = chat("zai-z/zai-org-glm-5-3-flash", "explain recursion", stream=False).json()["choices"][0]["message"]["reasoning_content"]
+        r2 = chat("logfare/kimi-k3", "explain recursion", stream=False).json()["choices"][0]["message"]["reasoning_content"]
+        check("thinking traces differ (GLM vs Kimi)", r1 != r2)
+        # streaming: reasoning deltas arrive BEFORE content deltas
+        order = []
+        with httpx.stream("POST", RT + "/api/chat", timeout=60, json={
+            "model": "zai-z/zai-org-glm-5-3-flash", "stream": True,
+            "messages": [{"role": "user", "content": "what is 12*12?"}]}) as r:
+            for line in r.iter_lines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload == "[DONE]":
+                    break
+                delta = json.loads(payload).get("choices", [{}])[0].get("delta", {})
+                if delta.get("reasoning_content"):
+                    order.append("think")
+                elif delta.get("content"):
+                    order.append("answer")
+        check("stream order: thinking first, then answer",
+              order and order[0] == "think" and "answer" in order and
+              order.index("answer") > 0 and all(o == "think" for o in order[:order.index("answer")]),
+              str(order[:6]))
 
         print("\n[6] usage tracking")
         models2 = httpx.get(RT + "/api/models").json()["models"]
