@@ -39,6 +39,7 @@ public/
 │   ├── 02-CAKEY-LIVE-DATA.md       cakey's live server, verified against production
 │   ├── 03-BUGS-AND-IMPROVEMENTS.md 10 real bugs found in the production code
 │   ├── 04-REASONING-MODELS.md      which models think + how thinking is extracted
+│   ├── 05-LMARENA-AUTH.md          how g4f's "lm arena" provider's "private key" really works
 │   ├── README.md                   research index
 │   ├── sources/                    copies of the actual g4f.dev source files
 │   ├── live-data/                  raw JSON snapshots of cakey's live server
@@ -504,6 +505,8 @@ cd research/g4f-reference-impl && python3 test_e2e.py
 | `research/02-CAKEY-LIVE-DATA.md` | Cakey's live server, verified against production |
 | `research/03-BUGS-AND-IMPROVEMENTS.md` | The 10 production bugs + fixes |
 | `research/04-REASONING-MODELS.md` | Which models think + the extraction process per vendor (sourced) |
+| `research/05-LMARENA-AUTH.md` | How the g4f LMArena provider's "private key" is really created (Supabase session + real-browser scraping) |
+| `research/sources/lmarena/LMArena.py` | The full LMArena provider source (732 ln, byte-exact) |
 | `research/sources/workers/api-worker.js` | The production backend Worker (the thing analyzed) |
 | `research/sources/workers/members-worker.js` | The production auth Worker |
 | `research/sources/workers/wrangler-*.toml` | Deploy configs (names, bindings) |

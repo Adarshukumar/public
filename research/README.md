@@ -14,8 +14,10 @@ Researched 2026-09-13 from the live site + the repo at commit `9d075d7`.
 | [`01-ARCHITECTURE.md`](01-ARCHITECTURE.md) | **The full explanation** — how the custom-server feature works end-to-end (browser → Cloudflare Worker → owner's upstream), with file/line references |
 | [`02-CAKEY-LIVE-DATA.md`](02-CAKEY-LIVE-DATA.md) | Live verification of cakey's server against the production API (what the `srv_…` ID actually resolves to) |
 | [`03-BUGS-AND-IMPROVEMENTS.md`](03-BUGS-AND-IMPROVEMENTS.md) | 10 real bugs found in the production code (incl. 2 crashes + 1 security issue) and the fixes |
+| [`05-LMARENA-AUTH.md`](05-LMARENA-AUTH.md) | How g4f's "lm arena" provider gets its "private key": the Supabase session cookie, real-browser scraping, the full API inventory |
 | [`fixes/g4f-dev-custom-server-fixes.patch`](fixes/g4f-dev-custom-server-fixes.patch) | Ready-to-apply git patch for `gpt4free/g4f.dev` with all fixes (syntax-checked with `node --check`) |
 | [`sources/`](sources/) | Copies of every key source file: the backend worker, auth worker, frontend addons, provider registry, config |
+| [`sources/lmarena/LMArena.py`](sources/lmarena/LMArena.py) | The full g4f LMArena provider source (732 ln, byte-exact from xtekky/gpt4free main) |
 | [`live-data/`](live-data/) | Raw production snapshots (cakey's server entry, models, status) |
 | [`g4f-reference-impl/`](g4f-reference-impl/) | **Working "deepened" re-implementation** in Python/FastAPI — run it, test it (32-check E2E suite), play with the chat UI |
 

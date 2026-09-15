@@ -667,11 +667,13 @@ public/
 │   ├── 02-CAKEY-LIVE-DATA.md     cakey's live server, verified
 │   ├── 03-BUGS-AND-IMPROVEMENTS.md  the 10 bugs, fully
 │   ├── 04-REASONING-MODELS.md    which models think + extraction (sourced)
+│   ├── 05-LMARENA-AUTH.md       how g4f's "lm arena" provider's "private key" really works
 │   ├── sources/                  the actual production source
 │   │   ├── workers/api-worker.js       the backend Worker (3.6k lines)
 │   │   ├── workers/members-worker.js   the auth Worker (4.1k lines)
 │   │   ├── workers/wrangler-*.toml     KV/R2/D1 bindings + routes
 │   │   └── chat/index.html             the production chat page
+│   │   └── lmarena/LMArena.py          the full g4f LMArena provider (732 ln)
 │   ├── live-data/                raw JSON: cakey-server / cakey-models / cakey-status
 │   ├── fixes/                    g4f-dev-custom-server-fixes.patch (14 hunks)
 │   └── g4f-reference-impl/       WORKING re-implementation + 33-check E2E
