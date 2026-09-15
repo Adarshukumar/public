@@ -2,14 +2,10 @@
 """
 Z.ai chat relay client — runs on a GitHub Actions runner (real internet egress).
 
-Reads job inputs from environment:
-  ZAI_PROMPT      (required) the user prompt
-  ZAI_CHAT_ID     (optional) continue this chat instead of creating a new one
-  ZAI_PARENT      (optional) previous assistant message id (multi-turn chain)
-  ZAI_GUEST_ID    (optional) guest user id from a previous turn
-  ZAI_GUEST_TOKEN (optional) guest JWT from a previous turn
-  ZAI_WEB_SEARCH  "true"/"false"
-  ZAI_THINKING    "true"/"false"
+Reads the job from an inbox file (argv[1] = path, JSON):
+  {"id","prompt","chat_id","parent","guest_id","guest_token","web_search","thinking"}
+(falls back to ZAI_* environment variables when no inbox file is given —
+used by workflow_dispatch). Also writes out/job_id.txt.
 
 Does the exact chat.z.ai flow (reverse-engineered from HAR, signature 3/3-verified):
   1. guest bootstrap (GET /api/v1/auths/)          [skipped when a guest is supplied]
@@ -53,17 +49,39 @@ def compute_signature(prompt, ts_ms, request_id, user_id):
                     hashlib.sha256).hexdigest()
 
 
+def load_job():
+    job = {"id": None, "prompt": "", "chat_id": None, "parent": None,
+           "guest_id": None, "guest_token": None,
+           "web_search": False, "thinking": True}
+    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+        d = json.load(open(sys.argv[1]))
+        job.update({k: d.get(k) for k in job if k in d})
+        return job
+    job["prompt"] = os.environ.get("ZAI_PROMPT", "").strip()
+    job["chat_id"] = os.environ.get("ZAI_CHAT_ID", "").strip() or None
+    job["parent"] = os.environ.get("ZAI_PARENT", "").strip() or None
+    job["guest_id"] = os.environ.get("ZAI_GUEST_ID", "").strip() or None
+    job["guest_token"] = os.environ.get("ZAI_GUEST_TOKEN", "").strip() or None
+    job["web_search"] = os.environ.get("ZAI_WEB_SEARCH", "false") == "true"
+    job["thinking"] = os.environ.get("ZAI_THINKING", "true") == "true"
+    return job
+
+
 def main():
     from curl_cffi import requests as cr
 
-    prompt = os.environ.get("ZAI_PROMPT", "").strip()
-    chat_id = os.environ.get("ZAI_CHAT_ID", "").strip() or None
-    parent = os.environ.get("ZAI_PARENT", "").strip() or None
-    guest_id = os.environ.get("ZAI_GUEST_ID", "").strip() or None
-    guest_token = os.environ.get("ZAI_GUEST_TOKEN", "").strip() or None
-    web_search = os.environ.get("ZAI_WEB_SEARCH", "false") == "true"
-    thinking = os.environ.get("ZAI_THINKING", "true") == "true"
+    job = load_job()
+    job_id = job.get("id") or str(uuid.uuid4())
+    (OUT / "job_id.txt").write_text(job_id)
+    prompt = (job.get("prompt") or "").strip()
+    chat_id = job.get("chat_id") or None
+    parent = job.get("parent") or None
+    guest_id = job.get("guest_id") or None
+    guest_token = job.get("guest_token") or None
+    web_search = bool(job.get("web_search"))
+    thinking = bool(job.get("thinking", True))
     device_id = "uid_" + uuid.uuid4().hex[:16]
+    log(f"job {job_id[:8]} prompt={prompt[:50]!r} chat={chat_id}")
 
     result = {"ok": False, "chat_id": chat_id, "guest": None, "assistant_id": None,
               "thinking": "", "tools": [], "toolres": "", "usage": None,
